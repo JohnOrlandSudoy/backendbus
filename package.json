@@ -1,0 +1,14 @@
+{
+  "name": "bus-tracking-backend",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node src/server.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.52.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0"
+  }
+}
