@@ -129,6 +129,134 @@ app.post('/api/admin/notification', async (req, res) => {
   }
 });
 
+// --- Terminals ---
+// Add Terminal
+app.post('/api/admin/terminal', async (req, res) => {
+  try {
+    const { name, address } = req.body;
+    const { data, error } = await supabase
+      .from('terminals')
+      .insert([{ name, address }])
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+    message.success('Terminal added successfully');
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List Terminals
+app.get('/api/admin/terminals', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('terminals')
+      .select('*');
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Routes ---
+// Add Route (with stops)
+app.post('/api/admin/route', async (req, res) => {
+  try {
+    const { name, start_terminal_id, end_terminal_id, stops } = req.body;
+    const { data: route, error: routeError } = await supabase
+      .from('routes')
+      .insert([{ name, start_terminal_id, end_terminal_id }])
+      .select()
+      .single();
+    if (routeError) throw routeError;
+    // Insert stops if provided
+    if (Array.isArray(stops) && stops.length > 0) {
+      const stopsData = stops.map((terminal_id, idx) => ({
+        route_id: route.id,
+        terminal_id,
+        stop_order: idx + 1
+      }));
+      const { error: stopsError } = await supabase
+        .from('route_stops')
+        .insert(stopsData);
+      if (stopsError) throw stopsError;
+    }
+    res.status(201).json(route);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List Routes (with stops)
+app.get('/api/admin/routes', async (req, res) => {
+  try {
+    // Get all routes
+    const { data: routes, error: routesError } = await supabase
+      .from('routes')
+      .select('*');
+    if (routesError) throw routesError;
+    // Get all stops
+    const { data: stops, error: stopsError } = await supabase
+      .from('route_stops')
+      .select('*');
+    if (stopsError) throw stopsError;
+    // Attach stops to routes
+    const routesWithStops = routes.map(route => ({
+      ...route,
+      stops: stops.filter(stop => stop.route_id === route.id)
+    }));
+    res.json(routesWithStops);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Buses ---
+// Register New Bus
+app.post('/api/admin/bus', async (req, res) => {
+  try {
+    const { bus_number, total_seats, terminal_id, route_id } = req.body;
+    const { data, error } = await supabase
+      .from('buses')
+      .insert([{ bus_number, total_seats, available_seats: total_seats, terminal_id, route_id }])
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// List Buses (for fleet)
+app.get('/api/admin/buses', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('buses')
+      .select('*');
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Live Map ---
+// Get all bus locations
+app.get('/api/admin/bus-locations', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('buses')
+      .select('id, bus_number, current_location');
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Employee Routes
 app.post('/api/employee/report', async (req, res) => {
   try {
@@ -197,6 +325,48 @@ app.post('/api/auth/login', async (req, res) => {
       password
     });
 
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- User Management (Admin) ---
+// Get all users
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*');
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get only client users
+app.get('/api/admin/users/clients', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('role', 'client');
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get only employee users
+app.get('/api/admin/users/employees', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('*')
+      .eq('role', 'employee');
     if (error) throw error;
     res.json(data);
   } catch (error) {

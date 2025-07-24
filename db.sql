@@ -58,7 +58,36 @@ CREATE TABLE reports (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Terminals table
+CREATE TABLE terminals (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  address TEXT NOT NULL
+);
+
+-- Routes table
+CREATE TABLE routes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  start_terminal_id UUID REFERENCES terminals(id),
+  end_terminal_id UUID REFERENCES terminals(id)
+);
+
+-- Route stops (for intermediate stops)
+CREATE TABLE route_stops (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  route_id UUID REFERENCES routes(id),
+  terminal_id UUID REFERENCES terminals(id),
+  stop_order INTEGER NOT NULL
+);
+
+-- Update buses table to reference terminal and route
+ALTER TABLE buses ADD COLUMN terminal_id UUID REFERENCES terminals(id);
+ALTER TABLE buses ADD COLUMN route_id UUID REFERENCES routes(id);
+
 -- Enable real-time for notifications
 ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "Allow read for all" ON notifications FOR SELECT USING (true);
 CREATE POLICY "Allow insert for authenticated" ON notifications FOR INSERT WITH CHECK (auth.role() = 'authenticated');
+-- Remove the old route column from buses table (no longer needed)
+ALTER TABLE buses DROP COLUMN route;
