@@ -28,14 +28,19 @@ app.get('/api/client/bus-eta/:busId', async (req, res) => {
   try {
     const { data: bus, error } = await supabase
       .from('buses')
-      .select('id, bus_number, route, current_location')
+      .select('id, bus_number, route_id, current_location, route:routes(name, start_terminal_id, end_terminal_id)')
       .eq('id', req.params.busId)
       .single();
     
     if (error) throw error;
     
     // Calculate ETA (implement your logic here, e.g., with a mapping API)
-    res.json({ eta: '15 minutes', currentLocation: bus.current_location });
+    res.json({ 
+      eta: '15 minutes', 
+      currentLocation: bus.current_location,
+      route: bus.route,
+      busNumber: bus.bus_number
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -52,10 +57,19 @@ app.post('/api/client/booking', async (req, res) => {
 
     if (error) throw error;
 
-    // Update available seats
+    // Fetch current available seats
+    const { data: bus, error: busError } = await supabase
+      .from('buses')
+      .select('available_seats')
+      .eq('id', busId)
+      .single();
+    if (busError) throw busError;
+
+    // Decrement and update
+    const newSeats = bus.available_seats - 1;
     await supabase
       .from('buses')
-      .update({ available_seats: supabase.raw('available_seats - 1') })
+      .update({ available_seats: newSeats })
       .eq('id', busId);
 
     res.status(201).json(booking);
@@ -277,18 +291,33 @@ app.post('/api/employee/report', async (req, res) => {
 app.put('/api/employee/passenger-count/:busId', async (req, res) => {
   try {
     const { action } = req.body; // 'add' or 'remove'
-    const update = action === 'add'
-      ? { available_seats: supabase.raw('available_seats - 1') }
-      : { available_seats: supabase.raw('available_seats + 1') };
-    const { data: bus, error } = await supabase
+
+    // 1. Fetch current available_seats
+    const { data: bus, error: fetchError } = await supabase
       .from('buses')
-      .update(update)
+      .select('available_seats')
+      .eq('id', req.params.busId)
+      .single();
+    if (fetchError) throw fetchError;
+
+    // 2. Calculate new value
+    let newSeats = bus.available_seats;
+    if (action === 'add') {
+      newSeats = bus.available_seats - 1;
+    } else if (action === 'remove') {
+      newSeats = bus.available_seats + 1;
+    }
+
+    // 3. Update the value
+    const { data: updatedBus, error: updateError } = await supabase
+      .from('buses')
+      .update({ available_seats: newSeats })
       .eq('id', req.params.busId)
       .select()
       .single();
+    if (updateError) throw updateError;
 
-    if (error) throw error;
-    res.json(bus);
+    res.json(updatedBus);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
