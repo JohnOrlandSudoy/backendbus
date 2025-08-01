@@ -2,6 +2,7 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const crypto = require('crypto');
 
 dotenv.config();
 const app = express();
@@ -24,23 +25,25 @@ supabase
   .subscribe();
 
 // Client Routes
-app.get('/api/client/bus-eta/:busId', async (req, res) => {
+app.get('/api/client/bus-eta', async (req, res) => {
   try {
-    const { data: bus, error } = await supabase
+    const { data: buses, error } = await supabase
       .from('buses')
       .select('id, bus_number, route_id, current_location, route:routes(name, start_terminal_id, end_terminal_id)')
-      .eq('id', req.params.busId)
-      .single();
+      .eq('status', 'active');
     
     if (error) throw error;
     
-    // Calculate ETA (implement your logic here, e.g., with a mapping API)
-    res.json({ 
-      eta: '15 minutes', 
+    // Map buses to include ETA (placeholder) and relevant details
+    const response = buses.map(bus => ({
+      busId: bus.id,
+      busNumber: bus.bus_number,
+      eta: '15 minutes', // Placeholder: Replace with mapping API logic
       currentLocation: bus.current_location,
-      route: bus.route,
-      busNumber: bus.bus_number
-    });
+      route: bus.route
+    }));
+
+    res.json(response);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -95,22 +98,6 @@ app.post('/api/client/feedback', async (req, res) => {
 });
 
 // Admin Routes
-app.put('/api/admin/bus/:id/reassign', async (req, res) => {
-  try {
-    const { driverId, conductorId, route } = req.body;
-    const { data: bus, error } = await supabase
-      .from('buses')
-      .update({ driver_id: driverId, conductor_id: conductorId, route })
-      .eq('id', req.params.id)
-      .select()
-      .single();
-
-    if (error) throw error;
-    res.json(bus);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 app.get('/api/admin/transit-insights', async (req, res) => {
   try {
@@ -143,6 +130,29 @@ app.post('/api/admin/notification', async (req, res) => {
   }
 });
 
+// --- Report Management (Admin) ---
+// Get all reports
+app.get('/api/admin/reports', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('reports')
+      .select(`
+        id,
+        type,
+        description,
+        created_at,
+        employee:employee_id(id, username, email, profile),
+        bus:bus_id(id, bus_number)
+      `)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Terminals ---
 // Add Terminal
 app.post('/api/admin/terminal', async (req, res) => {
@@ -155,7 +165,7 @@ app.post('/api/admin/terminal', async (req, res) => {
       .single();
     if (error) throw error;
     res.status(201).json(data);
-    message.success('Terminal added successfully');
+    // Note: Removed message.success as it's not defined in Node.js (likely frontend code)
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -304,7 +314,8 @@ app.put('/api/employee/passenger-count/:busId', async (req, res) => {
     let newSeats = bus.available_seats;
     if (action === 'add') {
       newSeats = bus.available_seats - 1;
-    } else if (action === 'remove') {
+    }
+    else if (action === 'remove') {
       newSeats = bus.available_seats + 1;
     }
 
@@ -389,13 +400,466 @@ app.get('/api/admin/users/clients', async (req, res) => {
   }
 });
 
-// Get only employee users
+// Get only employee users (all employee types)
 app.get('/api/admin/users/employees', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('users')
       .select('*')
-      .eq('role', 'employee');
+      .in('role', ['employee', 'driver', 'conductor'])
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get only drivers
+app.get('/api/admin/users/drivers', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, username, employee_id, email, profile, assigned_bus_id, status, created_at')
+      .eq('role', 'driver')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get only conductors
+app.get('/api/admin/users/conductors', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, username, employee_id, email, profile, assigned_bus_id, status, created_at')
+      .eq('role', 'conductor')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Confirm employee account
+app.put('/api/admin/employee/:id/confirm', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .update({ status: 'active' })
+      .eq('id', req.params.id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get employee by ID
+app.get('/api/admin/employee/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('users')
+      .select('id, username, email, role, profile, status, assigned_bus_id')
+      .eq('id', req.params.id)
+      .in('role', ['driver', 'conductor', 'employee'])
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Employee Management (Admin) ---
+// Create new employee account
+app.post('/api/admin/employee/create', async (req, res) => {
+  try {
+    const {
+      fullName,
+      phone,
+      role, // 'driver' or 'conductor'
+      email, // Employee's real email
+      password, // Employee's password
+      busId // Optional: assign to bus immediately
+    } = req.body;
+
+    // Validate required fields
+    if (!fullName || !phone || !role || !email || !password) {
+      return res.status(400).json({
+        error: 'Missing required fields: fullName, phone, role, email, password'
+      });
+    }
+
+    // Validate role
+    if (!['driver', 'conductor'].includes(role)) {
+      return res.status(400).json({
+        error: 'Role must be either "driver" or "conductor"'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        error: 'Invalid email format'
+      });
+    }
+
+    // Check if email already exists
+    const { data: existingEmployee } = await supabase
+      .from('users')
+      .select('email')
+      .eq('email', email)
+      .single();
+
+    if (existingEmployee) {
+      return res.status(400).json({
+        error: 'Email already exists'
+      });
+    }
+
+    // 1. Create auth user (with email confirmation disabled in Supabase settings)
+    console.log('Creating Supabase auth user with email:', email);
+    const { data: authData, error: authError } = await supabase.auth.signUp({
+      email,
+      password,
+      options: {
+        data: { username: email.split('@')[0], role },
+        emailRedirectTo: undefined // No email confirmation needed
+      }
+    });
+
+    if (authError) {
+      console.log('Supabase auth signup error:', authError);
+      throw authError;
+    }
+
+    console.log('Supabase auth user created:', authData.user?.id);
+
+    // 2. Create user profile
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .insert({
+        id: authData.user.id,
+        username: email.split('@')[0], // Use email prefix as username
+        email,
+        role,
+        employee_id: null, // Remove employee_id since we're using email
+        assigned_bus_id: busId || null,
+        profile: {
+          fullName,
+          phone,
+          position: role,
+          created_date: new Date().toISOString()
+        },
+        status: 'pending'
+      })
+      .select()
+      .single();
+
+    if (userError) throw userError;
+
+    // If bus assigned, update bus table
+    if (busId) {
+      const updateField = role === 'driver' ? 'driver_id' : 'conductor_id';
+      await supabase
+        .from('buses')
+        .update({ [updateField]: userData.id })
+        .eq('id', busId);
+    }
+
+    res.status(201).json({
+      employee: userData,
+      credentials: {
+        email,
+        password,
+        message: "Employee can login with their email and password"
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Employee login with Email and Password
+app.post('/api/auth/employee-login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: 'Email and password are required'
+      });
+    }
+
+    // Check if user exists and is an employee
+    const { data: employee, error: empError } = await supabase
+      .from('users')
+      .select('id, email, role, assigned_bus_id, status, profile, username')
+      .eq('email', email)
+      .in('role', ['driver', 'conductor', 'employee'])
+      .single();
+
+    if (empError) {
+      console.log('Employee lookup error:', empError);
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    console.log('Found employee:', { email: employee.email, role: employee.role, status: employee.status });
+
+    if (employee.status !== 'active') {
+      return res.status(403).json({ error: 'Employee account is not active' });
+    }
+
+    // Login with email using Supabase auth
+    console.log('Attempting login with email:', employee.email);
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: employee.email,
+      password
+    });
+
+    if (error) {
+      console.log('Supabase auth error:', error);
+      return res.status(401).json({
+        error: 'Invalid credentials',
+        debug: error.message
+      });
+    }
+
+    res.json({
+      success: true,
+      session: data.session,
+      employee: {
+        id: data.user.id,
+        email: employee.email,
+        username: employee.username,
+        role: employee.role,
+        assignedBusId: employee.assigned_bus_id,
+        profile: {
+          fullName: employee.profile?.fullName,
+          phone: employee.profile?.phone,
+          position: employee.profile?.position
+        }
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get employee's assigned bus info
+app.get('/api/employee/my-bus', async (req, res) => {
+  try {
+    const { email } = req.query;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Employee email is required' });
+    }
+
+    const { data: employee, error: empError } = await supabase
+      .from('users')
+      .select(`
+        assigned_bus_id,
+        role,
+        bus:assigned_bus_id(
+          id,
+          bus_number,
+          total_seats,
+          available_seats,
+          current_location,
+          status,
+          route:route_id(name, start_terminal_id, end_terminal_id)
+        )
+      `)
+      .eq('email', email)
+      .in('role', ['driver', 'conductor', 'employee'])
+      .single();
+
+    if (empError) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    if (!employee.assigned_bus_id) {
+      return res.json({ message: 'No bus assigned', bus: null });
+    }
+
+    res.json({
+      role: employee.role,
+      bus: employee.bus
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Assign employee to bus
+app.put('/api/admin/employee/assign-bus', async (req, res) => {
+  try {
+    const { busId, email } = req.body;
+
+    if (!busId || !email) {
+      return res.status(400).json({ error: 'Bus ID and employee email are required' });
+    }
+
+    // Get employee details
+    const { data: employee, error: empError } = await supabase
+      .from('users')
+      .select('id, role, username, profile, status')
+      .eq('email', email)
+      .in('role', ['driver', 'conductor', 'employee'])
+      .single();
+
+    if (empError) {
+      return res.status(404).json({ error: 'Employee not found' });
+    }
+
+    // Check if employee is active
+    if (employee.status !== 'active') {
+      return res.status(403).json({ error: 'Employee account must be active before assignment' });
+    }
+
+    // Update user's assigned bus
+    await supabase
+      .from('users')
+      .update({ assigned_bus_id: busId })
+      .eq('email', email);
+
+    // Update bus assignment
+    const updateField = employee.role === 'driver' ? 'driver_id' : 'conductor_id';
+    const { data: updatedBus, error: busError } = await supabase
+      .from('buses')
+      .update({ [updateField]: employee.id })
+      .eq('id', busId)
+      .select()
+      .single();
+
+    if (busError) throw busError;
+
+    res.json({
+      message: `${employee.role} ${employee.profile?.fullName || employee.username} assigned to bus successfully`,
+      bus: updatedBus
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Feedback Management (Admin) ---
+// Get all feedback submissions
+app.get('/api/admin/feedbacks', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('feedbacks')
+      .select(`
+        id,
+        rating,
+        comment,
+        created_at,
+        user:user_id(id, username, email, profile),
+        bus:bus_id(id, bus_number, route_id, route:route_id(name))
+      `)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get feedback by bus ID
+app.get('/api/admin/feedbacks/bus/:busId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('feedbacks')
+      .select(`
+        id,
+        rating,
+        comment,
+        created_at,
+        user:user_id(id, username, email, profile)
+      `)
+      .eq('bus_id', req.params.busId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get feedback statistics
+app.get('/api/admin/feedbacks/stats', async (req, res) => {
+  try {
+    // Get overall feedback stats
+    const { data: allFeedbacks, error: feedbackError } = await supabase
+      .from('feedbacks')
+      .select('rating, bus_id');
+
+    if (feedbackError) throw feedbackError;
+
+    // Calculate statistics
+    const totalFeedbacks = allFeedbacks.length;
+    const averageRating = totalFeedbacks > 0
+      ? (allFeedbacks.reduce((sum, feedback) => sum + feedback.rating, 0) / totalFeedbacks).toFixed(2)
+      : 0;
+
+    // Rating distribution
+    const ratingDistribution = {
+      1: allFeedbacks.filter(f => f.rating === 1).length,
+      2: allFeedbacks.filter(f => f.rating === 2).length,
+      3: allFeedbacks.filter(f => f.rating === 3).length,
+      4: allFeedbacks.filter(f => f.rating === 4).length,
+      5: allFeedbacks.filter(f => f.rating === 5).length
+    };
+
+    // Bus-wise feedback count
+    const busFeedbackCount = allFeedbacks.reduce((acc, feedback) => {
+      acc[feedback.bus_id] = (acc[feedback.bus_id] || 0) + 1;
+      return acc;
+    }, {});
+
+    const stats = {
+      totalFeedbacks,
+      averageRating: parseFloat(averageRating),
+      ratingDistribution,
+      busFeedbackCount
+    };
+
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get feedback by user ID
+app.get('/api/admin/feedbacks/user/:userId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('feedbacks')
+      .select(`
+        id,
+        rating,
+        comment,
+        created_at,
+        bus:bus_id(id, bus_number, route_id, route:route_id(name))
+      `)
+      .eq('user_id', req.params.userId)
+      .order('created_at', { ascending: false });
+
     if (error) throw error;
     res.json(data);
   } catch (error) {
