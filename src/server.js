@@ -81,6 +81,22 @@ app.post('/api/client/booking', async (req, res) => {
   }
 });
 
+app.get('/api/client/bookings', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('bookings')
+      .select(`
+        *,
+        bus:bus_id(bus_number, route:route_id(name)),
+        user:user_id(username, email, profile)
+      `);
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/client/feedback', async (req, res) => {
   try {
     const { userId, busId, rating, comment } = req.body;
@@ -109,6 +125,71 @@ app.get('/api/admin/transit-insights', async (req, res) => {
     if (error) throw error;
     // Add real-time analytics logic here
     res.json(buses);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Confirm a booking and send notifications
+app.put('/api/admin/booking/:id/confirm', async (req, res) => {
+  try {
+    // 1. Confirm the booking
+    const { data: booking, error: bookingError } = await supabase
+      .from('bookings')
+      .update({ status: 'confirmed' })
+      .eq('id', req.params.id)
+      .select(`
+        *,
+        bus:bus_id(*, route:route_id(name)),
+        user:user_id(*)
+      `)
+      .single();
+
+    if (bookingError) throw bookingError;
+    if (!booking) return res.status(404).json({ error: 'Booking not found' });
+
+    // 2. Prepare notification details
+    const { bus, user } = booking;
+    const driverId = bus.driver_id;
+    const conductorId = bus.conductor_id;
+    const clientId = user.id;
+
+    const notifications = [];
+
+    // 3. Create notification for the client
+    notifications.push({
+      recipient_id: clientId,
+      type: 'booking_confirmed',
+      message: `Your booking for bus ${bus.bus_number} (${bus.route.name}) has been confirmed.`
+    });
+
+    // 4. Create notification for the driver
+    if (driverId) {
+      notifications.push({
+        recipient_id: driverId,
+        type: 'new_passenger',
+        message: `New passenger: ${user.profile?.fullName || user.username} has booked a seat on your bus.`
+      });
+    }
+
+    // 5. Create notification for the conductor
+    if (conductorId) {
+      notifications.push({
+        recipient_id: conductorId,
+        type: 'new_passenger',
+        message: `New passenger: ${user.profile?.fullName || user.username} has booked a seat on your bus.`
+      });
+    }
+
+    // 6. Insert all notifications
+    if (notifications.length > 0) {
+      const { error: notificationError } = await supabase
+        .from('notifications')
+        .insert(notifications);
+      if (notificationError) throw notificationError;
+    }
+
+    res.json(booking);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -654,6 +735,48 @@ app.post('/api/auth/employee-login', async (req, res) => {
         }
       }
     });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get employee's notifications
+app.get('/api/employee/notifications', async (req, res) => {
+  try {
+    const { employeeId } = req.query;
+    if (!employeeId) {
+      return res.status(400).json({ error: 'Employee ID is required' });
+    }
+    
+    const { data, error } = await supabase
+      .from('notifications')
+      .select('*')
+      .eq('recipient_id', employeeId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get client's notifications
+app.get('/api/client/notifications', async (req, res) => {
+  try {
+    const { userId } = req.query;
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .select('*')
+      .eq('recipient_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
