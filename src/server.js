@@ -265,6 +265,104 @@ app.get('/api/admin/terminals', async (req, res) => {
   }
 });
 
+// Edit Terminal
+app.put('/api/admin/terminal/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, address } = req.body;
+
+    // Validate required fields
+    if (!name || !address) {
+      return res.status(400).json({ error: 'Name and address are required' });
+    }
+
+    // Check if terminal exists
+    const { data: existingTerminal, error: checkError } = await supabase
+      .from('terminals')
+      .select('id')
+      .eq('id', id)
+      .single();
+
+    if (checkError || !existingTerminal) {
+      return res.status(404).json({ error: 'Terminal not found' });
+    }
+
+    // Update terminal
+    const { data, error } = await supabase
+      .from('terminals')
+      .update({ name, address })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete Terminal
+app.delete('/api/admin/terminal/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if terminal exists
+    const { data: existingTerminal, error: checkError } = await supabase
+      .from('terminals')
+      .select('id')
+      .eq('id', id)
+      .single();
+
+    if (checkError || !existingTerminal) {
+      return res.status(404).json({ error: 'Terminal not found' });
+    }
+
+    // Check if terminal is being used by any routes
+    const { data: routesUsingTerminal, error: routesError } = await supabase
+      .from('routes')
+      .select('id, name')
+      .or(`start_terminal_id.eq.${id},end_terminal_id.eq.${id}`);
+
+    if (routesError) throw routesError;
+
+    if (routesUsingTerminal && routesUsingTerminal.length > 0) {
+      return res.status(400).json({
+        error: 'Cannot delete terminal',
+        message: 'Terminal is being used by routes',
+        routes: routesUsingTerminal.map(route => ({ id: route.id, name: route.name }))
+      });
+    }
+
+    // Check if terminal is being used by any route stops
+    const { data: stopsUsingTerminal, error: stopsError } = await supabase
+      .from('route_stops')
+      .select('id, route_id')
+      .eq('terminal_id', id);
+
+    if (stopsError) throw stopsError;
+
+    if (stopsUsingTerminal && stopsUsingTerminal.length > 0) {
+      return res.status(400).json({
+        error: 'Cannot delete terminal',
+        message: 'Terminal is being used as a stop in routes',
+        stops: stopsUsingTerminal
+      });
+    }
+
+    // Delete terminal
+    const { error } = await supabase
+      .from('terminals')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ message: 'Terminal deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Routes ---
 // Add Route (with stops)
 app.post('/api/admin/route', async (req, res) => {
@@ -313,6 +411,209 @@ app.get('/api/admin/routes', async (req, res) => {
       stops: stops.filter(stop => stop.route_id === route.id)
     }));
     res.json(routesWithStops);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Edit Route
+app.put('/api/admin/route/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, start_terminal_id, end_terminal_id, stops } = req.body;
+
+    // Validate required fields
+    if (!name || !start_terminal_id || !end_terminal_id) {
+      return res.status(400).json({ error: 'Name, start_terminal_id, and end_terminal_id are required' });
+    }
+
+    // Check if route exists
+    const { data: existingRoute, error: checkError } = await supabase
+      .from('routes')
+      .select('id')
+      .eq('id', id)
+      .single();
+
+    if (checkError || !existingRoute) {
+      return res.status(404).json({ error: 'Route not found' });
+    }
+
+    // Validate terminals exist
+    const { data: terminals, error: terminalsError } = await supabase
+      .from('terminals')
+      .select('id')
+      .in('id', [start_terminal_id, end_terminal_id]);
+
+    if (terminalsError) throw terminalsError;
+
+    if (terminals.length !== 2) {
+      return res.status(400).json({ error: 'Start or end terminal not found' });
+    }
+
+    // Update route
+    const { data: updatedRoute, error: routeError } = await supabase
+      .from('routes')
+      .update({ name, start_terminal_id, end_terminal_id })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (routeError) throw routeError;
+
+    // Update stops if provided
+    if (Array.isArray(stops)) {
+      // Delete existing stops
+      await supabase
+        .from('route_stops')
+        .delete()
+        .eq('route_id', id);
+
+      // Insert new stops if any
+      if (stops.length > 0) {
+        const stopsData = stops.map((terminal_id, idx) => ({
+          route_id: id,
+          terminal_id,
+          stop_order: idx + 1
+        }));
+
+        const { error: stopsError } = await supabase
+          .from('route_stops')
+          .insert(stopsData);
+
+        if (stopsError) throw stopsError;
+      }
+    }
+
+    // Get updated route with stops
+    const { data: finalRoute, error: finalError } = await supabase
+      .from('routes')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (finalError) throw finalError;
+
+    // Get stops for the route
+    const { data: routeStops, error: stopsError } = await supabase
+      .from('route_stops')
+      .select('*')
+      .eq('route_id', id);
+
+    if (stopsError) throw stopsError;
+
+    const routeWithStops = {
+      ...finalRoute,
+      stops: routeStops || []
+    };
+
+    res.json(routeWithStops);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete Route
+app.delete('/api/admin/route/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Check if route exists
+    const { data: existingRoute, error: checkError } = await supabase
+      .from('routes')
+      .select('id, name')
+      .eq('id', id)
+      .single();
+
+    if (checkError || !existingRoute) {
+      return res.status(404).json({ error: 'Route not found' });
+    }
+
+    // Check if route is being used by any buses
+    const { data: busesUsingRoute, error: busesError } = await supabase
+      .from('buses')
+      .select('id, bus_number')
+      .eq('route_id', id);
+
+    if (busesError) throw busesError;
+
+    if (busesUsingRoute && busesUsingRoute.length > 0) {
+      return res.status(400).json({
+        error: 'Cannot delete route',
+        message: 'Route is being used by buses',
+        buses: busesUsingRoute.map(bus => ({ id: bus.id, bus_number: bus.bus_number }))
+      });
+    }
+
+    // Delete route stops first (due to foreign key constraint)
+    await supabase
+      .from('route_stops')
+      .delete()
+      .eq('route_id', id);
+
+    // Delete route
+    const { error } = await supabase
+      .from('routes')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ message: 'Route deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single terminal by ID
+app.get('/api/admin/terminal/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data, error } = await supabase
+      .from('terminals')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Terminal not found' });
+    }
+
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get single route by ID (with stops)
+app.get('/api/admin/route/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get route
+    const { data: route, error: routeError } = await supabase
+      .from('routes')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (routeError) {
+      return res.status(404).json({ error: 'Route not found' });
+    }
+
+    // Get stops for the route
+    const { data: stops, error: stopsError } = await supabase
+      .from('route_stops')
+      .select('*')
+      .eq('route_id', id)
+      .order('stop_order', { ascending: true });
+
+    if (stopsError) throw stopsError;
+
+    const routeWithStops = {
+      ...route,
+      stops: stops || []
+    };
+
+    res.json(routeWithStops);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
