@@ -1,3 +1,4 @@
+// Get notifications for a specific client by user id
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
@@ -14,15 +15,66 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 app.use(cors());
 app.use(express.json());
 
-// Supabase real-time subscriptions
-supabase
-  .channel('notifications')
-  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications' }, (payload) => {
-    // Broadcast new notifications to connected clients
-    // You can integrate with a frontend WebSocket client here
-    console.log('New notification:', payload);
-  })
-  .subscribe();
+// Enhanced Supabase real-time subscriptions for notifications
+const notificationChannels = new Map();
+
+// Function to create notification channel for a specific user
+const createNotificationChannel = (userId) => {
+  if (notificationChannels.has(userId)) {
+    return notificationChannels.get(userId);
+  }
+
+  const channel = supabase
+    .channel(`notifications_${userId}`)
+    .on('postgres_changes', 
+      { 
+        event: 'INSERT', 
+        schema: 'public', 
+        table: 'notifications',
+        filter: `recipient_id=eq.${userId}`
+      }, 
+      (payload) => {
+        console.log(`🔔 Real-time notification for user ${userId}:`, payload);
+        // This will be handled by frontend WebSocket connection
+      }
+    )
+    .on('postgres_changes',
+      {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'notifications',
+        filter: `recipient_id=eq.${userId}`
+      },
+      (payload) => {
+        console.log(`🔄 Notification updated for user ${userId}:`, payload);
+      }
+    )
+    .on('postgres_changes',
+      {
+        event: 'DELETE',
+        schema: 'public',
+        table: 'notifications',
+        filter: `recipient_id=eq.${userId}`
+      },
+      (payload) => {
+        console.log(`🗑️ Notification deleted for user ${userId}:`, payload);
+      }
+    )
+    .subscribe();
+
+  notificationChannels.set(userId, channel);
+  return channel;
+};
+
+// Cleanup function for notification channels
+const cleanupNotificationChannel = (userId) => {
+  if (notificationChannels.has(userId)) {
+    const channel = notificationChannels.get(userId);
+    channel.unsubscribe();
+    notificationChannels.delete(userId);
+    console.log(`🧹 Cleaned up notification channel for user ${userId}`);
+  }
+};
 
 // Client Routes
 app.get('/api/client/bus-eta', async (req, res) => {
@@ -159,7 +211,7 @@ app.put('/api/admin/booking/:id/confirm', async (req, res) => {
     // 3. Create notification for the client
     notifications.push({
       recipient_id: clientId,
-      type: 'booking_confirmed',
+      type: 'general',
       message: `Your booking for bus ${bus.bus_number} (${bus.route.name}) has been confirmed.`
     });
 
@@ -167,7 +219,7 @@ app.put('/api/admin/booking/:id/confirm', async (req, res) => {
     if (driverId) {
       notifications.push({
         recipient_id: driverId,
-        type: 'new_passenger',
+        type: 'general',
         message: `New passenger: ${user.profile?.fullName || user.username} has booked a seat on your bus.`
       });
     }
@@ -176,7 +228,7 @@ app.put('/api/admin/booking/:id/confirm', async (req, res) => {
     if (conductorId) {
       notifications.push({
         recipient_id: conductorId,
-        type: 'new_passenger',
+        type: 'general',
         message: `New passenger: ${user.profile?.fullName || user.username} has booked a seat on your bus.`
       });
     }
@@ -194,18 +246,576 @@ app.put('/api/admin/booking/:id/confirm', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+// ===== NOTIFICATION MANAGEMENT SYSTEM =====
 
+// --- Admin Notification Endpoints ---
+
+// Send notification to specific user(s)
 app.post('/api/admin/notification', async (req, res) => {
   try {
-    const { recipientId, type, message } = req.body;
-    const { data: notification, error } = await supabase
+    const { recipient_ids, type, message, title } = req.body;
+    
+    // Validate required fields
+    if (!recipient_ids || !type || !message) {
+      return res.status(400).json({ 
+        error: 'recipient_ids, type, and message are required' 
+      });
+    }
+
+    // Validate notification type against allowed values
+    const allowedTypes = ['delay', 'route_change', 'traffic', 'general', 'announcement', 'maintenance'];
+    if (!allowedTypes.includes(type)) {
+      return res.status(400).json({ 
+        error: 'Invalid notification type',
+        allowedTypes 
+      });
+    }
+
+    // Handle single recipient or multiple recipients
+    const recipients = Array.isArray(recipient_ids) ? recipient_ids : [recipient_ids];
+    
+    // Create notifications for all recipients
+    const notifications = recipients.map(recipient_id => ({
+      recipient_id,
+      type,
+      message,
+      title: title || null,
+      is_read: false,
+      priority: type === 'maintenance' || type === 'delay' ? 'high' : 'normal'
+    }));
+
+    const { data, error } = await supabase
       .from('notifications')
-      .insert({ recipient_id: recipientId, type, message })
+      .insert(notifications)
+      .select();
+
+    if (error) throw error;
+
+    // Create real-time channels for new recipients
+    recipients.forEach(recipient_id => {
+      createNotificationChannel(recipient_id);
+    });
+
+    res.status(201).json({
+      message: `Notifications sent to ${recipients.length} recipient(s)`,
+      notifications: data
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Send notification to all users of a specific role
+app.post('/api/admin/notification/broadcast', async (req, res) => {
+  try {
+    const { role, type, message, title } = req.body;
+    
+    if (!role || !type || !message) {
+      return res.status(400).json({ 
+        error: 'role, type, and message are required' 
+      });
+    }
+
+    // Get all users with the specified role
+    const { data: users, error: usersError } = await supabase
+      .from('users')
+      .select('id')
+      .eq('role', role)
+      .eq('status', 'active');
+
+    if (usersError) throw usersError;
+
+    if (!users || users.length === 0) {
+      return res.status(404).json({ 
+        error: `No active users found with role: ${role}` 
+      });
+    }
+
+    // Create notifications for all users
+    const notifications = users.map(user => ({
+      recipient_id: user.id,
+      type,
+      message,
+      title: title || null,
+      is_read: false,
+      priority: type === 'maintenance' || type === 'delay' ? 'high' : 'normal'
+    }));
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .insert(notifications)
+      .select();
+
+    if (error) throw error;
+
+    // Create real-time channels for all recipients
+    users.forEach(user => {
+      createNotificationChannel(user.id);
+    });
+
+    res.status(201).json({
+      message: `Broadcast notification sent to ${users.length} ${role}(s)`,
+      notifications: data
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get all notifications (admin view)
+app.get('/api/admin/notifications', async (req, res) => {
+  try {
+    const { page = 1, limit = 50, type, recipient_id, is_read } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = supabase
+      .from('notifications')
+      .select(`
+        *,
+        recipient:recipient_id(id, username, email, role, profile)
+      `)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    // Apply filters
+    if (type) query = query.eq('type', type);
+    if (recipient_id) query = query.eq('recipient_id', recipient_id);
+    if (is_read !== undefined) query = query.eq('is_read', is_read === 'true');
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Get total count for pagination
+    const { count } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true });
+
+    res.json({
+      notifications: data,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get notification statistics
+app.get('/api/admin/notifications/stats', async (req, res) => {
+  try {
+    const { data: notifications, error } = await supabase
+      .from('notifications')
+      .select('type, is_read, created_at');
+
+    if (error) throw error;
+
+    const stats = {
+      total: notifications.length,
+      unread: notifications.filter(n => !n.is_read).length,
+      read: notifications.filter(n => n.is_read).length,
+      byType: {},
+      byDate: {}
+    };
+
+    // Count by type
+    notifications.forEach(notification => {
+      stats.byType[notification.type] = (stats.byType[notification.type] || 0) + 1;
+    });
+
+    // Count by date (last 7 days)
+    const last7Days = Array.from({ length: 7 }, (_, i) => {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      return date.toISOString().split('T')[0];
+    });
+
+    last7Days.forEach(date => {
+      stats.byDate[date] = notifications.filter(n => 
+        n.created_at.startsWith(date)
+      ).length;
+    });
+
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Client Notification Endpoints ---
+
+// Get client's notifications with pagination and filters
+app.get('/api/client/notifications', async (req, res) => {
+  try {
+    const { userId, page = 1, limit = 20, type, is_read, priority } = req.query;
+    
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const offset = (page - 1) * limit;
+
+    let query = supabase
+      .from('notifications')
+      .select('*')
+      .eq('recipient_id', userId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    // Apply filters
+    if (type) query = query.eq('type', type);
+    if (is_read !== undefined) query = query.eq('is_read', is_read === 'true');
+    if (priority) query = query.eq('priority', priority);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Get total count for pagination
+    const { count } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .eq('recipient_id', userId);
+
+    // Create real-time channel for this user
+    createNotificationChannel(userId);
+
+    res.json({
+      notifications: data,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark notification as read
+app.put('/api/client/notification/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    // Verify the notification belongs to the user
+    const { data: notification, error: checkError } = await supabase
+      .from('notifications')
+      .select('id, recipient_id')
+      .eq('id', id)
+      .eq('recipient_id', userId)
+      .single();
+
+    if (checkError || !notification) {
+      return res.status(404).json({ error: 'Notification not found or access denied' });
+    }
+
+    // Mark as read
+    const { data, error } = await supabase
+      .from('notifications')
+      .update({ is_read: true, read_at: new Date().toISOString() })
+      .eq('id', id)
       .select()
       .single();
 
     if (error) throw error;
-    res.status(201).json(notification);
+
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark all notifications as read for a user
+app.put('/api/client/notifications/read-all', async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .update({ 
+        is_read: true, 
+        read_at: new Date().toISOString() 
+      })
+      .eq('recipient_id', userId)
+      .eq('is_read', false)
+      .select();
+
+    if (error) throw error;
+
+    res.json({
+      message: `Marked ${data.length} notifications as read`,
+      updatedCount: data.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a specific notification
+app.delete('/api/client/notification/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    // Verify the notification belongs to the user
+    const { data: notification, error: checkError } = await supabase
+      .from('notifications')
+      .select('id, recipient_id')
+      .eq('id', id)
+      .eq('recipient_id', userId)
+      .single();
+
+    if (checkError || !notification) {
+      return res.status(404).json({ error: 'Notification not found or access denied' });
+    }
+
+    // Delete the notification
+    const { error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+
+    res.json({ message: 'Notification deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete all read notifications for a user
+app.delete('/api/client/notifications/delete-read', async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const { data, error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('recipient_id', userId)
+      .eq('is_read', true)
+      .select();
+
+    if (error) throw error;
+
+    res.json({
+      message: `Deleted ${data.length} read notifications`,
+      deletedCount: data.length
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get unread notification count for a user
+app.get('/api/client/notifications/unread-count', async (req, res) => {
+  try {
+    const { userId } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const { count, error } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .eq('recipient_id', userId)
+      .eq('is_read', false);
+
+    if (error) throw error;
+
+    res.json({ unreadCount: count });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Employee Notification Endpoints ---
+
+// Get employee's notifications
+app.get('/api/employee/notifications', async (req, res) => {
+  try {
+    const { employeeId, page = 1, limit = 20, type, is_read } = req.query;
+    
+    if (!employeeId) {
+      return res.status(400).json({ error: 'Employee ID is required' });
+    }
+
+    const offset = (page - 1) * limit;
+
+    let query = supabase
+      .from('notifications')
+      .select('*')
+      .eq('recipient_id', employeeId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    // Apply filters
+    if (type) query = query.eq('type', type);
+    if (is_read !== undefined) query = query.eq('is_read', is_read === 'true');
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Get total count for pagination
+    const { count } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .eq('recipient_id', employeeId);
+
+    // Create real-time channel for this employee
+    createNotificationChannel(employeeId);
+
+    res.json({
+      notifications: data,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark employee notification as read
+app.put('/api/employee/notification/:id/read', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { employeeId } = req.body;
+
+    if (!employeeId) {
+      return res.status(400).json({ error: 'Employee ID is required' });
+    }
+
+    // Verify the notification belongs to the employee
+    const { data: notification, error: checkError } = await supabase
+      .from('notifications')
+      .select('id, recipient_id')
+      .eq('id', id)
+      .eq('recipient_id', employeeId)
+      .single();
+
+    if (checkError || !notification) {
+      return res.status(404).json({ error: 'Notification not found or access denied' });
+    }
+
+    // Mark as read
+    const { data, error } = await supabase
+      .from('notifications')
+      .update({ is_read: true, read_at: new Date().toISOString() })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Utility Endpoints ---
+
+// Test endpoint to verify routing
+app.get('/api/admin/notification/test', (req, res) => {
+  console.log('🧪 Test endpoint hit!');
+  res.json({ message: 'Notification routing is working!' });
+});
+
+// Get notifications by recipient ID (admin view)
+app.get('/api/admin/notification/recipient/:recipient_id', async (req, res) => {
+  try {
+    const { recipient_id } = req.params;
+    const { type, is_read, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+    
+    if (!recipient_id) {
+      return res.status(400).json({ error: 'Recipient ID is required' });
+    }
+
+    let query = supabase
+      .from('notifications')
+      .select('*')
+      .eq('recipient_id', recipient_id)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (type) query = query.eq('type', type);
+    if (is_read !== undefined) query = query.eq('is_read', is_read === 'true');
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Get total count for pagination
+    const { count } = await supabase
+      .from('notifications')
+      .select('*', { count: 'exact', head: true })
+      .eq('recipient_id', recipient_id);
+
+    res.json({
+      notifications: data,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get a specific notification by ID (admin view)
+app.get('/api/admin/notification/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    if (!id) {
+      return res.status(400).json({ error: 'Notification ID is required' });
+    }
+
+    const { data: notification, error } = await supabase
+      .from('notifications')
+      .select(`
+        *,
+        recipient:recipient_id(id, username, email, role, profile)
+      `)
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return res.status(404).json({ error: 'Notification not found' });
+      }
+      throw error;
+    }
+
+    res.json(notification);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -255,12 +865,21 @@ app.post('/api/admin/terminal', async (req, res) => {
 // List Terminals
 app.get('/api/admin/terminals', async (req, res) => {
   try {
+    console.log('Fetching all terminals...');
+    
     const { data, error } = await supabase
       .from('terminals')
       .select('*');
-    if (error) throw error;
+      
+    if (error) {
+      console.error('Error fetching terminals:', error);
+      return res.status(500).json({ error: 'Error fetching terminals', details: error.message });
+    }
+    
+    console.log('Terminals fetched:', data);
     res.json(data);
   } catch (error) {
+    console.error('Unexpected error in terminals fetch:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -368,12 +987,51 @@ app.delete('/api/admin/terminal/:id', async (req, res) => {
 app.post('/api/admin/route', async (req, res) => {
   try {
     const { name, start_terminal_id, end_terminal_id, stops } = req.body;
+    
+    console.log('Creating route with data:', { name, start_terminal_id, end_terminal_id, stops });
+    
+    // Validate required fields
+    if (!name || !start_terminal_id || !end_terminal_id) {
+      return res.status(400).json({ 
+        error: 'Missing required fields', 
+        required: ['name', 'start_terminal_id', 'end_terminal_id'],
+        received: { name, start_terminal_id, end_terminal_id }
+      });
+    }
+
+    // Check if terminals exist
+    const { data: terminals, error: terminalsError } = await supabase
+      .from('terminals')
+      .select('id, name')
+      .in('id', [start_terminal_id, end_terminal_id]);
+
+    if (terminalsError) {
+      console.error('Error checking terminals:', terminalsError);
+      return res.status(500).json({ error: 'Error checking terminals', details: terminalsError.message });
+    }
+
+    if (terminals.length !== 2) {
+      return res.status(400).json({ 
+        error: 'Start or end terminal not found',
+        found_terminals: terminals,
+        requested_terminals: [start_terminal_id, end_terminal_id]
+      });
+    }
+
+    // Create route
     const { data: route, error: routeError } = await supabase
       .from('routes')
       .insert([{ name, start_terminal_id, end_terminal_id }])
       .select()
       .single();
-    if (routeError) throw routeError;
+    
+    if (routeError) {
+      console.error('Error creating route:', routeError);
+      return res.status(500).json({ error: 'Error creating route', details: routeError.message });
+    }
+
+    console.log('Route created successfully:', route);
+
     // Insert stops if provided
     if (Array.isArray(stops) && stops.length > 0) {
       const stopsData = stops.map((terminal_id, idx) => ({
@@ -381,13 +1039,25 @@ app.post('/api/admin/route', async (req, res) => {
         terminal_id,
         stop_order: idx + 1
       }));
-      const { error: stopsError } = await supabase
+      
+      console.log('Creating stops:', stopsData);
+      
+      const { data: createdStops, error: stopsError } = await supabase
         .from('route_stops')
-        .insert(stopsData);
-      if (stopsError) throw stopsError;
+        .insert(stopsData)
+        .select();
+        
+      if (stopsError) {
+        console.error('Error creating stops:', stopsError);
+        return res.status(500).json({ error: 'Error creating route stops', details: stopsError.message });
+      }
+      
+      console.log('Stops created successfully:', createdStops);
     }
+    
     res.status(201).json(route);
   } catch (error) {
+    console.error('Unexpected error in route creation:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -395,23 +1065,43 @@ app.post('/api/admin/route', async (req, res) => {
 // List Routes (with stops)
 app.get('/api/admin/routes', async (req, res) => {
   try {
+    console.log('Fetching all routes...');
+    
     // Get all routes
     const { data: routes, error: routesError } = await supabase
       .from('routes')
       .select('*');
-    if (routesError) throw routesError;
+      
+    if (routesError) {
+      console.error('Error fetching routes:', routesError);
+      return res.status(500).json({ error: 'Error fetching routes', details: routesError.message });
+    }
+    
+    console.log('Routes fetched:', routes);
+
     // Get all stops
     const { data: stops, error: stopsError } = await supabase
       .from('route_stops')
       .select('*');
-    if (stopsError) throw stopsError;
+      
+    if (stopsError) {
+      console.error('Error fetching stops:', stopsError);
+      return res.status(500).json({ error: 'Error fetching stops', details: stopsError.message });
+    }
+    
+    console.log('Stops fetched:', stops);
+
     // Attach stops to routes
     const routesWithStops = routes.map(route => ({
       ...route,
       stops: stops.filter(stop => stop.route_id === route.id)
     }));
+    
+    console.log('Routes with stops:', routesWithStops);
+    
     res.json(routesWithStops);
   } catch (error) {
+    console.error('Unexpected error in routes fetch:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -750,10 +1440,10 @@ app.post('/api/auth/login', async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (error) {
+    console.error('Login error:', error); // Add this line
     res.status(500).json({ error: error.message });
   }
 });
-
 // --- User Management (Admin) ---
 // Get all users
 app.get('/api/admin/users', async (req, res) => {
@@ -1041,47 +1731,7 @@ app.post('/api/auth/employee-login', async (req, res) => {
   }
 });
 
-// Get employee's notifications
-app.get('/api/employee/notifications', async (req, res) => {
-  try {
-    const { employeeId } = req.query;
-    if (!employeeId) {
-      return res.status(400).json({ error: 'Employee ID is required' });
-    }
-    
-    const { data, error } = await supabase
-      .from('notifications')
-      .select('*')
-      .eq('recipient_id', employeeId)
-      .order('created_at', { ascending: false });
 
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get client's notifications
-app.get('/api/client/notifications', async (req, res) => {
-  try {
-    const { userId } = req.query;
-    if (!userId) {
-      return res.status(400).json({ error: 'User ID is required' });
-    }
-
-    const { data, error } = await supabase
-      .from('notifications')
-      .select('*')
-      .eq('recipient_id', userId)
-      .order('created_at', { ascending: false });
-
-    if (error) throw error;
-    res.json(data);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // Get employee's assigned bus info
 app.get('/api/employee/my-bus', async (req, res) => {
@@ -1293,4 +1943,33 @@ app.get('/api/admin/feedbacks/user/:userId', async (req, res) => {
 
 // Start server
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
+// Graceful shutdown handling
+process.on('SIGTERM', () => {
+  console.log('🔄 SIGTERM received, shutting down gracefully...');
+  
+  // Cleanup all notification channels
+  notificationChannels.forEach((channel, userId) => {
+    cleanupNotificationChannel(userId);
+  });
+  
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('🔄 SIGINT received, shutting down gracefully...');
+  
+  // Cleanup all notification channels
+  notificationChannels.forEach((channel, userId) => {
+    cleanupNotificationChannel(userId);
+  });
+  
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
+});
