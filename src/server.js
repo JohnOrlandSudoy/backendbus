@@ -17,6 +17,21 @@ app.use(express.json());
 
 // Enhanced Supabase real-time subscriptions for notifications
 const notificationChannels = new Map();
+const sseClientsByUser = new Map(); // userId -> Set<res>
+
+// Broadcast helper to push events to all SSE clients for a given user
+const broadcastToUser = (userId, event) => {
+  const clients = sseClientsByUser.get(String(userId));
+  if (!clients || clients.size === 0) return;
+  const payload = JSON.stringify(event);
+  clients.forEach((res) => {
+    try {
+      res.write(`data: ${payload}\n\n`);
+    } catch (err) {
+      // Drop broken clients silently
+    }
+  });
+};
 
 // Function to create notification channel for a specific user
 const createNotificationChannel = (userId) => {
@@ -34,8 +49,8 @@ const createNotificationChannel = (userId) => {
         filter: `recipient_id=eq.${userId}`
       }, 
       (payload) => {
-        console.log(`🔔 Real-time notification for user ${userId}:`, payload);
-        // This will be handled by frontend WebSocket connection
+        // New notification for this user
+        broadcastToUser(userId, { type: 'notification.insert', data: payload.new });
       }
     )
     .on('postgres_changes',
@@ -46,7 +61,7 @@ const createNotificationChannel = (userId) => {
         filter: `recipient_id=eq.${userId}`
       },
       (payload) => {
-        console.log(`🔄 Notification updated for user ${userId}:`, payload);
+        broadcastToUser(userId, { type: 'notification.update', data: payload.new, old: payload.old });
       }
     )
     .on('postgres_changes',
@@ -57,7 +72,7 @@ const createNotificationChannel = (userId) => {
         filter: `recipient_id=eq.${userId}`
       },
       (payload) => {
-        console.log(`🗑️ Notification deleted for user ${userId}:`, payload);
+        broadcastToUser(userId, { type: 'notification.delete', data: payload.old });
       }
     )
     .subscribe();
@@ -75,6 +90,52 @@ const cleanupNotificationChannel = (userId) => {
     console.log(`🧹 Cleaned up notification channel for user ${userId}`);
   }
 };
+
+// Server-Sent Events (SSE) endpoint for real-time notifications per user
+app.get('/api/rt/notifications/:userId', (req, res) => {
+  const { userId } = req.params;
+  if (!userId) return res.status(400).json({ error: 'User ID is required' });
+
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  // Register client
+  if (!sseClientsByUser.has(String(userId))) {
+    sseClientsByUser.set(String(userId), new Set());
+  }
+  const clientSet = sseClientsByUser.get(String(userId));
+  clientSet.add(res);
+
+  // Ensure a channel exists for this user
+  createNotificationChannel(userId);
+
+  // Send an initial event for readiness
+  res.write(`data: ${JSON.stringify({ type: 'ready', userId })}\n\n`);
+
+  // Heartbeat to keep the connection alive behind proxies/LB
+  const HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS || 25000);
+  const heartbeat = setInterval(() => {
+    try { res.write(': ping\n\n'); } catch (_) {}
+  }, HEARTBEAT_MS);
+
+  // Cleanup on close
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    const set = sseClientsByUser.get(String(userId));
+    if (set) {
+      set.delete(res);
+      if (set.size === 0) {
+        sseClientsByUser.delete(String(userId));
+        // Optionally release Supabase channel to free resources
+        cleanupNotificationChannel(userId);
+      }
+    }
+    try { res.end(); } catch (_) {}
+  });
+});
 
 // Client Routes
 app.get('/api/client/bus-eta', async (req, res) => {
@@ -133,6 +194,58 @@ app.post('/api/client/booking', async (req, res) => {
   }
 });
 
+// Cancel a client's booking (soft delete via status)
+app.delete('/api/client/booking/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    const { data: booking, error: bookingErr } = await supabase
+      .from('bookings')
+      .select('id, user_id, bus_id, status')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (bookingErr || !booking) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    if (booking.status === 'cancelled') {
+      return res.json({ message: 'Booking already cancelled' });
+    }
+
+    // Set status to cancelled
+    const { error: updateErr } = await supabase
+      .from('bookings')
+      .update({ status: 'cancelled' })
+      .eq('id', id);
+    if (updateErr) throw updateErr;
+
+    // Increment available seats by 1 (guard against exceeding total)
+    const { data: bus, error: busErr } = await supabase
+      .from('buses')
+      .select('available_seats, total_seats')
+      .eq('id', booking.bus_id)
+      .single();
+    if (!busErr && bus) {
+      const newSeats = Math.min(bus.total_seats, (bus.available_seats || 0) + 1);
+      await supabase
+        .from('buses')
+        .update({ available_seats: newSeats })
+        .eq('id', booking.bus_id);
+    }
+
+    res.json({ message: 'Booking cancelled' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get('/api/client/bookings', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -160,6 +273,40 @@ app.post('/api/client/feedback', async (req, res) => {
 
     if (error) throw error;
     res.status(201).json(feedback);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete client's feedback
+app.delete('/api/client/feedback/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: 'User ID is required' });
+    }
+
+    // Ensure feedback belongs to the user
+    const { data: feedback, error: fbErr } = await supabase
+      .from('feedbacks')
+      .select('id, user_id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+
+    if (fbErr || !feedback) {
+      return res.status(404).json({ error: 'Feedback not found or access denied' });
+    }
+
+    const { error } = await supabase
+      .from('feedbacks')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ message: 'Feedback deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -242,6 +389,51 @@ app.put('/api/admin/booking/:id/confirm', async (req, res) => {
     }
 
     res.json(booking);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: cancel a booking (soft delete via status)
+app.delete('/api/admin/booking/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: booking, error: bookingErr } = await supabase
+      .from('bookings')
+      .select('id, bus_id, status')
+      .eq('id', id)
+      .single();
+
+    if (bookingErr || !booking) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    if (booking.status === 'cancelled') {
+      return res.json({ message: 'Booking already cancelled' });
+    }
+
+    const { error: updateErr } = await supabase
+      .from('bookings')
+      .update({ status: 'cancelled' })
+      .eq('id', id);
+    if (updateErr) throw updateErr;
+
+    // Increment available seats by 1 if bus exists
+    const { data: bus } = await supabase
+      .from('buses')
+      .select('available_seats, total_seats')
+      .eq('id', booking.bus_id)
+      .single();
+    if (bus) {
+      const newSeats = Math.min(bus.total_seats, (bus.available_seats || 0) + 1);
+      await supabase
+        .from('buses')
+        .update({ available_seats: newSeats })
+        .eq('id', booking.bus_id);
+    }
+
+    res.json({ message: 'Booking cancelled' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -440,6 +632,32 @@ app.get('/api/admin/notifications/stats', async (req, res) => {
     });
 
     res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: delete a notification by ID
+app.delete('/api/admin/notification/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: exists, error: checkErr } = await supabase
+      .from('notifications')
+      .select('id')
+      .eq('id', id)
+      .single();
+    if (checkErr || !exists) {
+      return res.status(404).json({ error: 'Notification not found' });
+    }
+
+    const { error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    res.json({ message: 'Notification deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -738,6 +956,40 @@ app.put('/api/employee/notification/:id/read', async (req, res) => {
   }
 });
 
+// Delete an employee's notification
+app.delete('/api/employee/notification/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { employeeId } = req.body;
+
+    if (!employeeId) {
+      return res.status(400).json({ error: 'Employee ID is required' });
+    }
+
+    // Verify the notification belongs to the employee
+    const { data: notification, error: checkError } = await supabase
+      .from('notifications')
+      .select('id, recipient_id')
+      .eq('id', id)
+      .eq('recipient_id', employeeId)
+      .single();
+
+    if (checkError || !notification) {
+      return res.status(404).json({ error: 'Notification not found or access denied' });
+    }
+
+    const { error } = await supabase
+      .from('notifications')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    res.json({ message: 'Notification deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Utility Endpoints ---
 
 // Test endpoint to verify routing
@@ -839,6 +1091,32 @@ app.get('/api/admin/reports', async (req, res) => {
 
     if (error) throw error;
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: delete a report by ID
+app.delete('/api/admin/report/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: report, error: checkErr } = await supabase
+      .from('reports')
+      .select('id')
+      .eq('id', id)
+      .single();
+    if (checkErr || !report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    const { error } = await supabase
+      .from('reports')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    res.json({ message: 'Report deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1326,6 +1604,27 @@ app.post('/api/admin/bus', async (req, res) => {
   }
 });
 
+// Get single Bus by ID (admin)
+app.get('/api/admin/bus/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: bus, error } = await supabase
+      .from('buses')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      return res.status(404).json({ error: 'Bus not found' });
+    }
+
+    res.json(bus);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // List Buses (for fleet)
 app.get('/api/admin/buses', async (req, res) => {
   try {
@@ -1334,6 +1633,154 @@ app.get('/api/admin/buses', async (req, res) => {
       .select('*');
     if (error) throw error;
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update Bus (admin)
+app.put('/api/admin/bus/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      bus_number,
+      total_seats,
+      available_seats,
+      terminal_id,
+      route_id,
+      status,
+      current_location,
+      driver_id,
+      conductor_id
+    } = req.body;
+
+    // Ensure bus exists
+    const { data: existingBus, error: existingError } = await supabase
+      .from('buses')
+      .select('id, available_seats, total_seats')
+      .eq('id', id)
+      .single();
+    if (existingError || !existingBus) {
+      return res.status(404).json({ error: 'Bus not found' });
+    }
+
+    // Optional validations
+    if (typeof total_seats === 'number' && total_seats < 0) {
+      return res.status(400).json({ error: 'total_seats must be >= 0' });
+    }
+    if (typeof available_seats === 'number' && available_seats < 0) {
+      return res.status(400).json({ error: 'available_seats must be >= 0' });
+    }
+
+    const effectiveTotalSeats = typeof total_seats === 'number' ? total_seats : existingBus.total_seats;
+    const effectiveAvailableSeats = typeof available_seats === 'number' ? available_seats : existingBus.available_seats;
+    if (effectiveAvailableSeats > effectiveTotalSeats) {
+      return res.status(400).json({ error: 'available_seats cannot exceed total_seats' });
+    }
+
+    // Validate terminal/route existence if provided
+    if (terminal_id) {
+      const { data: term, error: termErr } = await supabase
+        .from('terminals')
+        .select('id')
+        .eq('id', terminal_id)
+        .single();
+      if (termErr || !term) return res.status(400).json({ error: 'Invalid terminal_id' });
+    }
+    if (route_id) {
+      const { data: route, error: routeErr } = await supabase
+        .from('routes')
+        .select('id')
+        .eq('id', route_id)
+        .single();
+      if (routeErr || !route) return res.status(400).json({ error: 'Invalid route_id' });
+    }
+
+    // If bus_number is changing, ensure uniqueness
+    if (bus_number) {
+      const { data: dupCheck, error: dupErr } = await supabase
+        .from('buses')
+        .select('id')
+        .eq('bus_number', bus_number)
+        .neq('id', id);
+      if (dupErr) throw dupErr;
+      if (Array.isArray(dupCheck) && dupCheck.length > 0) {
+        return res.status(400).json({ error: 'bus_number already exists' });
+      }
+    }
+
+    const updatePayload = {
+      ...(bus_number !== undefined ? { bus_number } : {}),
+      ...(total_seats !== undefined ? { total_seats } : {}),
+      ...(available_seats !== undefined ? { available_seats } : {}),
+      ...(terminal_id !== undefined ? { terminal_id } : {}),
+      ...(route_id !== undefined ? { route_id } : {}),
+      ...(status !== undefined ? { status } : {}),
+      ...(current_location !== undefined ? { current_location } : {}),
+      ...(driver_id !== undefined ? { driver_id } : {}),
+      ...(conductor_id !== undefined ? { conductor_id } : {}),
+    };
+
+    const { data: updated, error } = await supabase
+      .from('buses')
+      .update(updatePayload)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+    res.json(updated);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete Bus (admin)
+app.delete('/api/admin/bus/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Ensure bus exists
+    const { data: bus, error: busErr } = await supabase
+      .from('buses')
+      .select('id, bus_number')
+      .eq('id', id)
+      .single();
+    if (busErr || !bus) {
+      return res.status(404).json({ error: 'Bus not found' });
+    }
+
+    // Detach any users assigned to this bus to avoid FK constraint
+    await supabase
+      .from('users')
+      .update({ assigned_bus_id: null })
+      .eq('assigned_bus_id', id);
+
+    // Check dependent records that would block deletion
+    const [{ count: bookingsCount }, { count: feedbacksCount }, { count: reportsCount }] = await Promise.all([
+      supabase.from('bookings').select('*', { count: 'exact', head: true }).eq('bus_id', id),
+      supabase.from('feedbacks').select('*', { count: 'exact', head: true }).eq('bus_id', id),
+      supabase.from('reports').select('*', { count: 'exact', head: true }).eq('bus_id', id),
+    ]);
+
+    if ((bookingsCount || 0) > 0 || (feedbacksCount || 0) > 0 || (reportsCount || 0) > 0) {
+      return res.status(400).json({
+        error: 'Cannot delete bus. It has dependent records.',
+        details: {
+          bookings: bookingsCount || 0,
+          feedbacks: feedbacksCount || 0,
+          reports: reportsCount || 0
+        }
+      });
+    }
+
+    const { error } = await supabase
+      .from('buses')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+    res.json({ message: `Bus ${bus.bus_number} deleted successfully` });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1365,6 +1812,40 @@ app.post('/api/employee/report', async (req, res) => {
 
     if (error) throw error;
     res.status(201).json(report);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Employee: delete own report
+app.delete('/api/employee/report/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { employeeId } = req.body;
+
+    if (!employeeId) {
+      return res.status(400).json({ error: 'Employee ID is required' });
+    }
+
+    // Verify report belongs to employee
+    const { data: report, error: checkErr } = await supabase
+      .from('reports')
+      .select('id, employee_id')
+      .eq('id', id)
+      .eq('employee_id', employeeId)
+      .single();
+
+    if (checkErr || !report) {
+      return res.status(404).json({ error: 'Report not found or access denied' });
+    }
+
+    const { error } = await supabase
+      .from('reports')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    res.json({ message: 'Report deleted successfully' });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1512,6 +1993,79 @@ app.get('/api/admin/users/conductors', async (req, res) => {
       .order('created_at', { ascending: false });
     if (error) throw error;
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a user (admin can delete any user, including own account)
+app.delete('/api/admin/user/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Ensure user exists
+    const { data: user, error: userErr } = await supabase
+      .from('users')
+      .select('id, username, email, role')
+      .eq('id', id)
+      .single();
+    if (userErr || !user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Detach bus role assignments if the user is a driver/conductor
+    await supabase
+      .from('buses')
+      .update({ driver_id: null })
+      .eq('driver_id', id);
+    await supabase
+      .from('buses')
+      .update({ conductor_id: null })
+      .eq('conductor_id', id);
+
+    // Nullify created_by references to this user
+    await supabase
+      .from('users')
+      .update({ created_by: null })
+      .eq('created_by', id);
+
+    // Delete notifications for this user (safe to hard-delete)
+    await supabase
+      .from('notifications')
+      .delete()
+      .eq('recipient_id', id);
+
+    // Block deletion if there are dependent business records
+    const [
+      { count: bookingsCount },
+      { count: feedbacksCount },
+      { count: reportsCount }
+    ] = await Promise.all([
+      supabase.from('bookings').select('*', { count: 'exact', head: true }).eq('user_id', id),
+      supabase.from('feedbacks').select('*', { count: 'exact', head: true }).eq('user_id', id),
+      supabase.from('reports').select('*', { count: 'exact', head: true }).eq('employee_id', id)
+    ]);
+
+    if ((bookingsCount || 0) > 0 || (feedbacksCount || 0) > 0 || (reportsCount || 0) > 0) {
+      return res.status(400).json({
+        error: 'Cannot delete user due to dependent records',
+        details: {
+          bookings: bookingsCount || 0,
+          feedbacks: feedbacksCount || 0,
+          reports: reportsCount || 0
+        },
+        note: 'Cancel/delete dependent records first, or consider a soft delete (status=inactive)'
+      });
+    }
+
+    // Finally, delete the user
+    const { error } = await supabase
+      .from('users')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    res.json({ message: `User ${user.username || user.email} deleted successfully` });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1941,9 +2495,47 @@ app.get('/api/admin/feedbacks/user/:userId', async (req, res) => {
   }
 });
 
+// Admin: delete a feedback by ID
+app.delete('/api/admin/feedback/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: fb, error: checkErr } = await supabase
+      .from('feedbacks')
+      .select('id')
+      .eq('id', id)
+      .single();
+    if (checkErr || !fb) {
+      return res.status(404).json({ error: 'Feedback not found' });
+    }
+
+    const { error } = await supabase
+      .from('feedbacks')
+      .delete()
+      .eq('id', id);
+    if (error) throw error;
+
+    res.json({ message: 'Feedback deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
+// Render/Proxies
+app.enable('trust proxy');
+
 const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
+// Tune HTTP server timeouts for long-lived SSE connections
+try {
+  server.requestTimeout = 0; // Disable per-request timeout
+  server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 65000);
+  server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 66000);
+} catch (_) {
+  // Best-effort only
+}
 
 // Graceful shutdown handling
 process.on('SIGTERM', () => {
