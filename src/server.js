@@ -3,10 +3,43 @@ const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const dotenv = require('dotenv');
+const Stripe = require('stripe');
+const sgMail = require('@sendgrid/mail');
 const crypto = require('crypto');
 
 dotenv.config();
 const app = express();
+
+// Initialize Stripe and SendGrid if keys are present
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2022-11-15' }) : null;
+if (process.env.SENDGRID_API_KEY) {
+  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+}
+
+// Startup diagnostics for Stripe configuration (safe, masked output)
+try {
+  const hasStripeKey = Boolean(process.env.STRIPE_SECRET_KEY);
+  const hasWebhookSecret = Boolean(process.env.STRIPE_WEBHOOK_SECRET);
+  if (!hasStripeKey) {
+    console.warn('⚠️  Stripe secret key not found in environment (STRIPE_SECRET_KEY). Stripe will be disabled.');
+  } else {
+    const masked = process.env.STRIPE_SECRET_KEY.replace(/.(?=.{4})/g, '*');
+    console.debug(`🔒 STRIPE_SECRET_KEY present: ${masked}`);
+  }
+  if (!hasWebhookSecret) {
+    console.warn('⚠️  Stripe webhook secret (STRIPE_WEBHOOK_SECRET) not configured. Webhook signature verification will fail if used.');
+  } else {
+    const maskedHook = process.env.STRIPE_WEBHOOK_SECRET.replace(/.(?=.{4})/g, '*');
+    console.debug(`🔐 STRIPE_WEBHOOK_SECRET present: ${maskedHook}`);
+  }
+  if (!stripe) {
+    console.warn('ℹ️  Stripe client not initialized. Calls to payment endpoints will return "Stripe is not configured".');
+  } else {
+    console.log('✅ Stripe client initialized.');
+  }
+} catch (diagErr) {
+  console.error('Error while checking Stripe environment variables:', diagErr);
+}
 
 // Initialize Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
@@ -14,6 +47,162 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// For Stripe webhook handling
+app.use('/webhook', express.raw({ type: 'application/json' }));
+
+// Helper: send simple receipt email via SendGrid (if configured)
+// Create a Stripe checkout session
+app.post('/api/create-payment-session', async (req, res) => {
+  if (!stripe) {
+    return res.status(500).json({ error: 'Stripe is not configured' });
+  }
+
+  try {
+    const { userId, busId, seats, totalPrice, routeName, date } = req.body;
+
+    // Create a pending booking in the database
+    const { data: booking, error: bookingError } = await supabase
+      .from('bookings')
+      .insert([{
+        user_id: userId,
+        bus_id: busId,
+        seats: seats,
+        status: 'pending',
+        payment_status: 'pending',
+        payment_method: 'online',
+        amount: totalPrice,
+        created_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (bookingError) throw bookingError;
+
+    // Create Stripe checkout session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: 'usd',
+          product_data: {
+            name: `Bus Booking - ${routeName}`,
+            description: `${seats.length} seat(s) for ${date}`,
+          },
+          unit_amount: totalPrice * 100, // Stripe expects amounts in cents
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
+      success_url: `${process.env.CLIENT_URL}/booking/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/booking/cancel`,
+      customer_email: booking.user_email,
+      metadata: {
+        booking_id: booking.id,
+        user_id: userId,
+        seats: seats.join(','),
+        route_name: routeName,
+        date: date
+      }
+    });
+
+    // Update booking with session ID
+    await supabase
+      .from('bookings')
+      .update({ payment_intent_id: session.payment_intent })
+      .eq('id', booking.id);
+
+    res.json({ sessionId: session.id });
+  } catch (error) {
+    console.error('Payment session creation failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Handle Stripe webhook
+app.post('/webhook', async (req, res) => {
+  if (!stripe) {
+    return res.status(500).json({ error: 'Stripe is not configured' });
+  }
+
+  const sig = req.headers['stripe-signature'];
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verification failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      
+      // Update booking status
+      const { error: updateError } = await supabase
+        .from('bookings')
+        .update({ 
+          payment_status: 'paid',
+          status: 'confirmed',
+          payment_intent_id: session.payment_intent,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', session.metadata.booking_id);
+
+      if (updateError) throw updateError;
+
+      // Send receipt email
+      await sendReceiptEmail({
+        to: session.customer_email,
+        booking: {
+          id: session.metadata.booking_id,
+          payment_intent_id: session.payment_intent
+        },
+        totalPrice: session.amount_total / 100,
+        seats: session.metadata.seats.split(','),
+        routeName: session.metadata.route_name,
+        date: session.metadata.date
+      });
+    }
+
+    res.json({ received: true });
+  } catch (error) {
+    console.error('Webhook processing failed:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, date }) => {
+  if (!process.env.SENDGRID_API_KEY) return false;
+  try {
+    const msg = {
+      to,
+      from: process.env.FROM_EMAIL || 'no-reply@auroride.com',
+      subject: `AuroRide Booking Receipt — ${booking.id}`,
+      html: `
+        <h2>AuroRide - Booking Receipt</h2>
+        <p><strong>Booking ID:</strong> ${booking.id}</p>
+        <p><strong>Route:</strong> ${routeName || 'N/A'}</p>
+        <p><strong>Date:</strong> ${date || 'N/A'}</p>
+        <p><strong>Seats:</strong> ${seats.join(', ')}</p>
+        <p><strong>Total:</strong> $${totalPrice}</p>
+        <p>If you have questions, reply to this email or contact our support.</p>
+      `,
+    };
+    await sgMail.send(msg);
+    return true;
+  } catch (err) {
+    console.error('Failed to send receipt email', err);
+    return false;
+  }
+};
+
+
 
 // Enhanced Supabase real-time subscriptions for notifications
 const notificationChannels = new Map();
@@ -194,6 +383,154 @@ app.post('/api/client/booking', async (req, res) => {
   }
 });
 
+// Create a Stripe Checkout session and a pending booking (online payment)
+app.post('/api/client/create-payment-session', async (req, res) => {
+  try {
+    if (!stripe) return res.status(500).json({ error: 'Stripe not configured on server.' });
+
+    const { userId, email, busId, seats = [], date, totalAmount } = req.body;
+    if (!userId || !busId || !email) return res.status(400).json({ error: 'userId, email and busId are required' });
+
+    // Create booking with pending payment
+    const bookingPayload = {
+      user_id: userId,
+      bus_id: busId,
+      status: 'pending',
+      payment_method: 'online',
+      payment_status: 'pending',
+      seats: seats || [],
+      travel_date: date || null,
+      amount: totalAmount || (15 * (seats?.length || 1)),
+      email: email,
+    };
+
+    const { data: booking, error: bookingErr } = await supabase
+      .from('bookings')
+      .insert(bookingPayload)
+      .select()
+      .single();
+
+    if (bookingErr) throw bookingErr;
+
+    const lineAmount = Math.round((bookingPayload.amount || 15) * 100); // cents
+    const seatCount = (seats && seats.length) || 1;
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'payment',
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: { name: `AuroRide — ${booking.id}` },
+            unit_amount: lineAmount,
+          },
+          quantity: seatCount,
+        }
+      ],
+      customer_email: email,
+      metadata: { bookingId: booking.id },
+      success_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/booking-success?bookingId=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/booking?bookingId=${booking.id}`,
+    });
+
+    // Store session id on booking for webhook correlation
+    await supabase
+      .from('bookings')
+      .update({ checkout_session_id: session.id, payment_intent_id: session.payment_intent || null })
+      .eq('id', booking.id);
+
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (error) {
+    console.error('create-payment-session error', error);
+    res.status(500).json({ error: error.message || 'Failed to create payment session' });
+  }
+});
+
+// Stripe webhook endpoint
+app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!stripe || !webhookSecret) {
+    return res.status(500).send('Stripe webhook not configured');
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+  } catch (err) {
+    console.error('Webhook signature verification failed.', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle the checkout.session.completed event
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const bookingId = session.metadata?.bookingId;
+
+    if (bookingId) {
+      try {
+        // Get booking record
+        const { data: booking } = await supabase
+          .from('bookings')
+          .select('*')
+          .eq('id', bookingId)
+          .single();
+
+        if (booking && booking.payment_status !== 'paid') {
+          // Update booking payment status
+          await supabase
+            .from('bookings')
+            .update({ payment_status: 'paid', status: 'confirmed', payment_intent_id: session.payment_intent || null })
+            .eq('id', bookingId);
+
+          // Optionally decrement available seats (if not already handled elsewhere)
+          try {
+            const { data: bus } = await supabase
+              .from('buses')
+              .select('available_seats')
+              .eq('id', booking.bus_id)
+              .single();
+            if (bus) {
+              const newSeats = Math.max(0, (bus.available_seats || 0) - (booking.seats?.length || 1));
+              await supabase
+                .from('buses')
+                .update({ available_seats: newSeats })
+                .eq('id', booking.bus_id);
+            }
+          } catch (seatErr) {
+            console.warn('Failed to adjust seats after payment:', seatErr.message || seatErr);
+          }
+
+          // Send receipt email if possible
+          try {
+            await sendReceiptEmail({
+              to: booking.email || session.customer_details?.email,
+              booking,
+              totalPrice: booking.amount,
+              seats: booking.seats || [],
+              routeName: booking.route_name || null,
+              date: booking.travel_date || null
+            });
+
+            await supabase
+              .from('bookings')
+              .update({ receipt_sent: true })
+              .eq('id', bookingId);
+          } catch (emailErr) {
+            console.warn('Failed to send receipt email:', emailErr.message || emailErr);
+          }
+        }
+      } catch (err) {
+        console.error('Failed to process checkout.session.completed:', err);
+      }
+    }
+  }
+
+  res.json({ received: true });
+});
+
 // Cancel a client's booking (soft delete via status)
 app.delete('/api/client/booking/:id', async (req, res) => {
   try {
@@ -307,6 +644,25 @@ app.delete('/api/client/feedback/:id', async (req, res) => {
 
     if (error) throw error;
     res.json({ message: 'Feedback deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/client/contact', async (req, res) => {
+  try {
+    const { fullName, email, message } = req.body;
+    if (!fullName || !email || !message) {
+      return res.status(400).json({ error: 'fullName, email, and message are required' });
+    }
+
+    const { data: contact, error } = await supabase
+      .from('contacts')
+      .insert({ full_name: fullName, email, message, status: 'new' })
+      .select('id, full_name, email, message, status, created_at')
+      .single();
+    if (error) throw error;
+    res.status(201).json(contact);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -662,6 +1018,43 @@ app.delete('/api/admin/notification/:id', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+app.get('/api/admin/contacts', async (req, res) => {
+  try {
+    const { page = 1, limit = 50, status, email } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = supabase
+      .from('contacts')
+      .select('id, full_name, email, message, status, created_at')
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (status) query = query.eq('status', status);
+    if (email) query = query.ilike('email', `%${email}%`);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    const { count } = await supabase
+      .from('contacts')
+      .select('*', { count: 'exact', head: true });
+
+    res.json({
+      contacts: data,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
 
 // --- Client Notification Endpoints ---
 
@@ -1921,8 +2314,21 @@ app.post('/api/auth/login', async (req, res) => {
     if (error) throw error;
     res.json(data);
   } catch (error) {
-    console.error('Login error:', error); // Add this line
-    res.status(500).json({ error: error.message });
+    console.error('Login error:', error);
+
+    // Detect network / DNS errors (e.g., ENOTFOUND) coming from underlying fetch
+    const cause = error && error.cause ? error.cause : null;
+    const isNetworkError = cause && (cause.code === 'ENOTFOUND' || cause.code === 'EAI_AGAIN' || cause.errno === -3008);
+
+    if (isNetworkError) {
+      // 503 indicates upstream service unavailable
+      return res.status(503).json({
+        error: 'Unable to reach Supabase. Check SUPABASE_URL, internet connection, and DNS settings.'
+      });
+    }
+
+    // Fallback - return generic server error
+    return res.status(500).json({ error: (error && error.message) ? error.message : String(error) });
   }
 });
 // --- User Management (Admin) ---
@@ -1942,7 +2348,7 @@ app.get('/api/admin/users', async (req, res) => {
 // Get only client users
 app.get('/api/admin/users/clients', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { data, error } = await supabase 
       .from('users')
       .select('*')
       .eq('role', 'client');
