@@ -85,6 +85,10 @@ app.post('/api/create-payment-session', async (req, res) => {
     if (bookingError) throw bookingError;
 
     // Create Stripe checkout session
+    const origin =
+      process.env.FRONTEND_URL ||
+      req.headers.origin ||
+      (req.get('referer') ? new URL(req.get('referer')).origin : 'https://auroride.xyz');
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       line_items: [{
@@ -184,7 +188,7 @@ app.post('/webhook', async (req, res) => {
 const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, date }) => {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey || !to) return false;
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+  const frontendUrl = process.env.FRONTEND_URL || 'https://auroride.xyz';
   const logoUrl = "https://ysxcngthzeajjrxwqgvq.supabase.co/storage/v1/object/public/Public/AuroRide.jpg";
   const safeSeats = Array.isArray(seats) ? seats.join(', ') : (seats || 'N/A');
   const safeRoute = routeName || 'N/A';
@@ -283,7 +287,7 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
 const sendConfirmationEmail = async ({ to, booking, routeName, date }) => {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey || !to) return false;
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+  const frontendUrl = process.env.FRONTEND_URL || 'https://auroride.xyz';
   const logoUrl = "https://ysxcngthzeajjrxwqgvq.supabase.co/storage/v1/object/public/Public/AuroRide.jpg";
   const safeRoute = routeName || 'N/A';
   const safeDate = date ? new Date(date).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
@@ -775,8 +779,8 @@ app.post('/api/client/create-payment-session', async (req, res) => {
         seats: (seats || []).join(','),
         date: date || ''
       },
-      success_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/booking-success?bookingId=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/booking?bookingId=${booking.id}`,
+      success_url: `${origin}/booking-success?bookingId=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/booking?bookingId=${booking.id}`,
     });
 
     // Store session id on booking for webhook correlation
