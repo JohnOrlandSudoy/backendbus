@@ -4,7 +4,6 @@ const { createClient } = require('@supabase/supabase-js');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const Stripe = require('stripe');
-const sgMail = require('@sendgrid/mail');
 const crypto = require('crypto');
 
 dotenv.config();
@@ -12,9 +11,6 @@ const app = express();
 
 // Initialize Stripe and SendGrid if keys are present
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2022-11-15' }) : null;
-if (process.env.SENDGRID_API_KEY) {
-  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-}
 
 // Startup diagnostics for Stripe configuration (safe, masked output)
 try {
@@ -43,10 +39,19 @@ try {
 
 // Initialize Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+const supabaseAdmin = process.env.SUPABASE_SERVICE_ROLE_KEY ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY) : null;
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+
+// Ensure oversized JSON bodies return JSON, not HTML
+app.use((err, req, res, next) => {
+  if (err && err.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Payload too large' });
+  }
+  next(err);
+});
 
 // For Stripe webhook handling
 app.use('/webhook', express.raw({ type: 'application/json' }));
@@ -148,7 +153,6 @@ app.post('/webhook', async (req, res) => {
         .from('bookings')
         .update({ 
           payment_status: 'paid',
-          status: 'confirmed',
           payment_intent_id: session.payment_intent,
           updated_at: new Date().toISOString()
         })
@@ -178,30 +182,313 @@ app.post('/webhook', async (req, res) => {
 });
 
 const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, date }) => {
-  if (!process.env.SENDGRID_API_KEY) return false;
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey || !to) return false;
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+  const logoUrl = "https://ysxcngthzeajjrxwqgvq.supabase.co/storage/v1/object/public/Public/AuroRide.jpg";
+  const safeSeats = Array.isArray(seats) ? seats.join(', ') : (seats || 'N/A');
+  const safeRoute = routeName || 'N/A';
+  const safeDate = date ? new Date(date).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
+  const safeTotal = typeof totalPrice === 'number' ? `$${totalPrice}` : `$${Number(totalPrice || 0)}`;
+  const html = `
+  <div style="background-color:#f6f7fb;padding:24px 0;margin:0;font-family:Arial,Helvetica,sans-serif;">
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+      <tr>
+        <td align="center" style="padding:0 16px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="max-width:600px;background-color:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e6e8ef;">
+            <tr>
+              <td style="background:linear-gradient(90deg,#f472b6,#fb7185);padding:24px;" align="center">
+                <img src="${logoUrl}" alt="AuroRide" width="88" height="88" style="border-radius:12px;display:block;border:2px solid rgba(255,255,255,0.6);" />
+                <div style="height:12px"></div>
+                <div style="font-size:20px;color:#fff;font-weight:700;letter-spacing:0.3px;">AuroRide Booking Receipt</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px;">
+                <div style="font-size:16px;color:#111827;font-weight:700;margin-bottom:12px;">Thank you for your booking!</div>
+                <div style="font-size:13px;color:#6b7280;line-height:1.6;margin-bottom:16px;">
+                  Below are the details of your reservation. Keep this email as your proof of purchase.
+                </div>
+                <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e6e8ef;border-radius:10px;overflow:hidden;">
+                  <tr style="background-color:#f9fafb;">
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Booking ID</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${booking.id}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Route</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${safeRoute}</td>
+                  </tr>
+                  <tr style="background-color:#f9fafb;">
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Date</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${safeDate}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Seats</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${safeSeats}</td>
+                  </tr>
+                  <tr style="background-color:#f9fafb;">
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Total Paid</td>
+                    <td style="padding:12px 16px;font-size:14px;color:#db2777;font-weight:700;">${safeTotal}</td>
+                  </tr>
+                </table>
+                <div style="height:16px"></div>
+                <a href="${frontendUrl}/booking?bookingId=${booking.id}" style="display:inline-block;background:#f472b6;color:#fff;text-decoration:none;font-size:13px;font-weight:700;border-radius:8px;padding:10px 16px;">
+                  View Booking
+                </a>
+                <div style="height:20px"></div>
+                <div style="font-size:12px;color:#6b7280;line-height:1.6;">
+                  If you have questions, reply to this email or contact our support.
+                </div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:16px;border-top:1px solid #e6e8ef;background-color:#fcfcfd;" align="center">
+                <div style="font-size:11px;color:#9ca3af;">© ${new Date().getFullYear()} AuroRide. All rights reserved.</div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </div>
+  `;
   try {
-    const msg = {
-      to,
-      from: process.env.FROM_EMAIL || 'no-reply@auroride.com',
-      subject: `AuroRide Booking Receipt — ${booking.id}`,
-      html: `
-        <h2>AuroRide - Booking Receipt</h2>
-        <p><strong>Booking ID:</strong> ${booking.id}</p>
-        <p><strong>Route:</strong> ${routeName || 'N/A'}</p>
-        <p><strong>Date:</strong> ${date || 'N/A'}</p>
-        <p><strong>Seats:</strong> ${seats.join(', ')}</p>
-        <p><strong>Total:</strong> $${totalPrice}</p>
-        <p>If you have questions, reply to this email or contact our support.</p>
-      `,
-    };
-    await sgMail.send(msg);
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        from: "team@auroride.xyz" || 'no-reply@auroride.com',
+        to: [to],
+        subject: `AuroRide Booking Receipt — ${booking.id}`,
+        html,
+      }),
+    });
+    if (!res.ok) {
+      try {
+        const errBody = await res.json();
+        console.error('Resend email error', errBody);
+      } catch (_) {}
+      return false;
+    }
     return true;
   } catch (err) {
-    console.error('Failed to send receipt email', err);
+    console.error('Resend request failed', err);
     return false;
   }
 };
 
+const sendConfirmationEmail = async ({ to, booking, routeName, date }) => {
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey || !to) return false;
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+  const logoUrl = "https://ysxcngthzeajjrxwqgvq.supabase.co/storage/v1/object/public/Public/AuroRide.jpg";
+  const safeRoute = routeName || 'N/A';
+  const safeDate = date ? new Date(date).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
+  const html = `
+  <div style="background-color:#f6f7fb;padding:24px 0;margin:0;font-family:Arial,Helvetica,sans-serif;">
+    <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+      <tr>
+        <td align="center" style="padding:0 16px;">
+          <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="max-width:600px;background-color:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e6e8ef;">
+            <tr>
+              <td style="background:linear-gradient(90deg,#22c55e,#16a34a);padding:24px;" align="center">
+                <img src="${logoUrl}" alt="AuroRide" width="88" height="88" style="border-radius:12px;display:block;border:2px solid rgba(255,255,255,0.6);" />
+                <div style="height:12px"></div>
+                <div style="font-size:20px;color:#fff;font-weight:700;letter-spacing:0.3px;">Booking Confirmed</div>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:24px;">
+                <div style="font-size:16px;color:#111827;font-weight:700;margin-bottom:12px;">Your reservation is confirmed</div>
+                <div style="font-size:13px;color:#6b7280;line-height:1.6;margin-bottom:16px;">
+                  We’ve confirmed your booking. Here are the key details.
+                </div>
+                <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="border:1px solid #e6e8ef;border-radius:10px;overflow:hidden;">
+                  <tr style="background-color:#f9fafb;">
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Booking ID</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${booking.id}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Route</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${safeRoute}</td>
+                  </tr>
+                  <tr style="background-color:#f9fafb;">
+                    <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Date</td>
+                    <td style="padding:12px 16px;font-size:12px;color:#111827;font-weight:600;">${safeDate}</td>
+                  </tr>
+                </table>
+                <div style="height:16px"></div>
+                <a href="${frontendUrl}/booking?bookingId=${booking.id}" style="display:inline-block;background:#16a34a;color:#fff;text-decoration:none;font-size:13px;font-weight:700;border-radius:8px;padding:10px 16px;">
+                  View Booking
+                </a>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:16px;border-top:1px solid #e6e8ef;background-color:#fcfcfd;" align="center">
+                <div style="font-size:11px;color:#9ca3af;">© ${new Date().getFullYear()} AuroRide. All rights reserved.</div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </div>
+  `;
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        from: "team@auroride.xyz" || 'no-reply@auroride.com',
+        to: [to],
+        subject: `AuroRide Booking Confirmed — ${booking.id}`,
+        html,
+      }),
+    });
+    if (!res.ok) {
+      try {
+        const errBody = await res.json();
+        console.error('Resend confirmation email error', errBody);
+      } catch (_) {}
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error('Resend confirmation request failed', err);
+    return false;
+  }
+};
+app.post('/api/client/booking/:id/send-receipt', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { data: booking, error } = await supabase
+      .from('bookings')
+      .select('*')
+      .eq('id', id)
+      .single();
+    if (error || !booking) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    if (booking.payment_status !== 'paid') {
+      return res.status(400).json({ error: 'Booking not paid' });
+    }
+    const to = booking.email;
+    const totalPrice = booking.amount;
+    const seats = booking.seats || [];
+    let routeName = booking.route_name || null;
+    if (!routeName && booking.bus_id) {
+      try {
+        const { data: busRow } = await supabase
+          .from('buses')
+          .select('route_id')
+          .eq('id', booking.bus_id)
+          .single();
+        const routeId = busRow?.route_id || null;
+        if (routeId) {
+          const { data: routeRow } = await supabase
+            .from('routes')
+            .select('name')
+            .eq('id', routeId)
+            .single();
+          routeName = routeRow?.name || null;
+        }
+      } catch (_) {}
+    }
+    const date = booking.travel_date || null;
+    const sent = await sendReceiptEmail({ to, booking, totalPrice, seats, routeName, date });
+    if (sent) {
+      await supabase
+        .from('bookings')
+        .update({ receipt_sent: true })
+        .eq('id', id);
+      return res.json({ success: true });
+    } else {
+      return res.status(500).json({ error: 'Failed to send receipt' });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: err && err.message ? err.message : 'Unexpected error' });
+  }
+});
+
+// Confirm Stripe payment by session_id and send receipt (for success page flow)
+app.post('/api/client/booking/:id/confirm-payment', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { session_id } = req.body || {};
+    if (!stripe) {
+      return res.status(500).json({ error: 'Stripe not configured on server.' });
+    }
+    if (!session_id || typeof session_id !== 'string') {
+      return res.status(400).json({ error: 'session_id is required' });
+    }
+    const session = await stripe.checkout.sessions.retrieve(session_id);
+    if (!session) {
+      return res.status(404).json({ error: 'Stripe session not found' });
+    }
+    if (session.payment_status !== 'paid' && session.status !== 'complete') {
+      return res.status(400).json({ error: 'Payment not completed' });
+    }
+    const { data: booking, error } = await supabase
+      .from('bookings')
+      .select('*')
+      .eq('id', id)
+      .single();
+    if (error || !booking) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    if (booking.payment_status !== 'paid') {
+      await supabase
+        .from('bookings')
+        .update({ payment_status: 'paid', payment_intent_id: session.payment_intent || null })
+        .eq('id', id);
+    }
+    // If receipt already sent, return success
+    if (booking.receipt_sent) {
+      return res.json({ success: true, message: 'Receipt already sent' });
+    }
+    const to = booking.email || session.customer_details?.email || session.customer_email;
+    const totalPrice = booking.amount;
+    const seats = booking.seats || [];
+    let routeName = session.metadata?.route_name || booking.route_name || null;
+    if (!routeName && booking.bus_id) {
+      try {
+        const { data: busRow } = await supabase
+          .from('buses')
+          .select('route_id')
+          .eq('id', booking.bus_id)
+          .single();
+        const routeId = busRow?.route_id || null;
+        if (routeId) {
+          const { data: routeRow } = await supabase
+            .from('routes')
+            .select('name')
+            .eq('id', routeId)
+            .single();
+          routeName = routeRow?.name || null;
+        }
+      } catch (_) {}
+    }
+    const date = booking.travel_date || null;
+    const sent = await sendReceiptEmail({ to, booking, totalPrice, seats, routeName, date });
+    if (sent) {
+      await supabase
+        .from('bookings')
+        .update({ receipt_sent: true })
+        .eq('id', id);
+      return res.json({ success: true, message: 'Receipt sent' });
+    } else {
+      return res.status(500).json({ error: 'Failed to send receipt' });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: err && err.message ? err.message : 'Unexpected error' });
+  }
+});
 
 
 // Enhanced Supabase real-time subscriptions for notifications
@@ -354,9 +641,25 @@ app.get('/api/client/bus-eta', async (req, res) => {
 app.post('/api/client/booking', async (req, res) => {
   try {
     const { userId, busId } = req.body;
+    const isValidUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+    const resolvedUserId = isValidUUID(userId) ? userId : null;
+    if (resolvedUserId) {
+      const { data: existingUser } = await supabase
+        .from('users')
+        .select('id')
+        .eq('id', resolvedUserId)
+        .single();
+      if (!existingUser) {
+        const email = req.body.email || '';
+        const username = email ? email.split('@')[0] : 'user';
+        await supabase
+          .from('users')
+          .insert({ id: resolvedUserId, email, username, role: 'client', profile: {} });
+      }
+    }
     const { data: booking, error } = await supabase
       .from('bookings')
-      .insert({ user_id: userId, bus_id: busId })
+      .insert({ user_id: resolvedUserId, bus_id: busId })
       .select()
       .single();
 
@@ -391,9 +694,46 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     const { userId, email, busId, seats = [], date, totalAmount } = req.body;
     if (!userId || !busId || !email) return res.status(400).json({ error: 'userId, email and busId are required' });
 
+    const isValidUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+    const resolvedUserId = isValidUUID(userId) ? userId : null;
+
+    if (resolvedUserId) {
+      const { data: existingUser } = await supabase
+        .from('users')
+        .select('id')
+        .eq('id', resolvedUserId)
+        .single();
+      if (!existingUser) {
+        await supabase
+          .from('users')
+          .insert({ id: resolvedUserId, email, username: email.split('@')[0], role: 'client', profile: {} });
+      }
+    }
+
+    // Resolve route name from bus -> routes
+    let resolvedRouteName = null;
+    try {
+      const { data: busRow } = await supabase
+        .from('buses')
+        .select('route_id')
+        .eq('id', busId)
+        .single();
+      const routeId = busRow?.route_id || null;
+      if (routeId) {
+        const { data: routeRow } = await supabase
+          .from('routes')
+          .select('name')
+          .eq('id', routeId)
+          .single();
+        resolvedRouteName = routeRow?.name || null;
+      }
+    } catch (_) {
+      // best-effort only
+    }
+
     // Create booking with pending payment
     const bookingPayload = {
-      user_id: userId,
+      user_id: resolvedUserId,
       bus_id: busId,
       status: 'pending',
       payment_method: 'online',
@@ -422,14 +762,19 @@ app.post('/api/client/create-payment-session', async (req, res) => {
         {
           price_data: {
             currency: 'usd',
-            product_data: { name: `AuroRide — ${booking.id}` },
+            product_data: { name: `AuroRide — ${resolvedRouteName || booking.id}` },
             unit_amount: lineAmount,
           },
           quantity: seatCount,
         }
       ],
       customer_email: email,
-      metadata: { bookingId: booking.id },
+      metadata: { 
+        bookingId: booking.id, 
+        route_name: resolvedRouteName || '', 
+        seats: (seats || []).join(','),
+        date: date || ''
+      },
       success_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/booking-success?bookingId=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/booking?bookingId=${booking.id}`,
     });
@@ -479,48 +824,45 @@ app.post('/api/webhook', express.raw({ type: 'application/json' }), async (req, 
           .single();
 
         if (booking && booking.payment_status !== 'paid') {
-          // Update booking payment status
           await supabase
             .from('bookings')
-            .update({ payment_status: 'paid', status: 'confirmed', payment_intent_id: session.payment_intent || null })
+            .update({ payment_status: 'paid', payment_intent_id: session.payment_intent || null })
             .eq('id', bookingId);
-
-          // Optionally decrement available seats (if not already handled elsewhere)
-          try {
-            const { data: bus } = await supabase
-              .from('buses')
-              .select('available_seats')
-              .eq('id', booking.bus_id)
-              .single();
-            if (bus) {
-              const newSeats = Math.max(0, (bus.available_seats || 0) - (booking.seats?.length || 1));
-              await supabase
+        }
+        try {
+          let routeName = session.metadata?.route_name || booking.route_name || null;
+          if (!routeName && booking.bus_id) {
+            try {
+              const { data: busRow } = await supabase
                 .from('buses')
-                .update({ available_seats: newSeats })
-                .eq('id', booking.bus_id);
-            }
-          } catch (seatErr) {
-            console.warn('Failed to adjust seats after payment:', seatErr.message || seatErr);
+                .select('route_id')
+                .eq('id', booking.bus_id)
+                .single();
+              const routeId = busRow?.route_id || null;
+              if (routeId) {
+                const { data: routeRow } = await supabase
+                  .from('routes')
+                  .select('name')
+                  .eq('id', routeId)
+                  .single();
+                routeName = routeRow?.name || null;
+              }
+            } catch (_) {}
           }
-
-          // Send receipt email if possible
-          try {
-            await sendReceiptEmail({
-              to: booking.email || session.customer_details?.email,
-              booking,
-              totalPrice: booking.amount,
-              seats: booking.seats || [],
-              routeName: booking.route_name || null,
-              date: booking.travel_date || null
-            });
-
-            await supabase
-              .from('bookings')
-              .update({ receipt_sent: true })
-              .eq('id', bookingId);
-          } catch (emailErr) {
-            console.warn('Failed to send receipt email:', emailErr.message || emailErr);
-          }
+          await sendReceiptEmail({
+            to: booking.email || session.customer_details?.email,
+            booking,
+            totalPrice: booking.amount,
+            seats: booking.seats || [],
+            routeName,
+            date: booking.travel_date || null
+          });
+          await supabase
+            .from('bookings')
+            .update({ receipt_sent: true })
+            .eq('id', bookingId);
+        } catch (emailErr) {
+          console.warn('Failed to send receipt email:', emailErr.message || emailErr);
         }
       } catch (err) {
         console.error('Failed to process checkout.session.completed:', err);
@@ -585,13 +927,19 @@ app.delete('/api/client/booking/:id', async (req, res) => {
 
 app.get('/api/client/bookings', async (req, res) => {
   try {
-    const { data, error } = await supabase
+    const { userId } = req.query;
+    let query = supabase
       .from('bookings')
       .select(`
-        *,
+        id, user_id, bus_id, status, payment_method, payment_status, seats, amount, travel_date, created_at, receipt_sent,
         bus:bus_id(bus_number, route:route_id(name)),
         user:user_id(username, email, profile)
-      `);
+      `)
+      .order('created_at', { ascending: false });
+    if (userId) {
+      query = query.eq('user_id', userId);
+    }
+    const { data, error } = await query;
     if (error) throw error;
     res.json(data);
   } catch (error) {
@@ -742,6 +1090,53 @@ app.put('/api/admin/booking/:id/confirm', async (req, res) => {
         .from('notifications')
         .insert(notifications);
       if (notificationError) throw notificationError;
+    }
+
+    try {
+      const to = booking.email || booking.user?.email || null;
+      let routeName = booking.bus?.route?.name || null;
+      if (!routeName && booking.bus_id) {
+        try {
+          const { data: busRow } = await supabase
+            .from('buses')
+            .select('route_id')
+            .eq('id', booking.bus_id)
+            .single();
+          const routeId = busRow?.route_id || null;
+          if (routeId) {
+            const { data: routeRow } = await supabase
+              .from('routes')
+              .select('name')
+              .eq('id', routeId)
+              .single();
+            routeName = routeRow?.name || null;
+          }
+        } catch (_) {}
+      }
+      const date = booking.travel_date || null;
+      if (to) {
+        await sendConfirmationEmail({ to, booking, routeName, date });
+      }
+    } catch (emailErr) {
+      console.warn('Admin confirm: failed to send confirmation email', emailErr && emailErr.message ? emailErr.message : emailErr);
+    }
+
+    try {
+      const { data: bus } = await supabase
+        .from('buses')
+        .select('available_seats, total_seats')
+        .eq('id', booking.bus_id)
+        .single();
+      if (bus) {
+        const dec = (booking.seats?.length || 1);
+        const newSeats = Math.max(0, (bus.available_seats || 0) - dec);
+        await supabase
+          .from('buses')
+          .update({ available_seats: newSeats })
+          .eq('id', booking.bus_id);
+      }
+    } catch (seatErr) {
+      console.warn('Admin confirm: failed to adjust seats', seatErr && seatErr.message ? seatErr.message : seatErr);
     }
 
     res.json(booking);
@@ -1653,6 +2048,132 @@ app.delete('/api/admin/terminal/:id', async (req, res) => {
   }
 });
 
+// ===== REFUND REQUESTS =====
+// Create a client refund request
+app.post('/api/client/refund', async (req, res) => {
+  try {
+    const { full_name, email, reason, proof_url, agree, booking_id } = req.body || {};
+    if (!full_name || !email || !reason) {
+      return res.status(400).json({ error: 'full_name, email, and reason are required' });
+    }
+    if (agree !== true) {
+      return res.status(400).json({ error: 'You must agree to the refund policy' });
+    }
+    const payload = {
+      full_name,
+      email,
+      reason,
+      proof_url: proof_url || null,
+      booking_id: booking_id || null,
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+    const { data, error } = await supabase
+      .from('refund_requests')
+      .insert(payload)
+      .select()
+      .single();
+    if (error) throw error;
+    res.status(201).json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to create refund request' });
+  }
+});
+
+// Upload refund proof (server-side to bypass RLS)
+app.post('/api/client/refund/upload', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Supabase service role is not configured on server' });
+    }
+    const { file_base64, filename, content_type, user_id, email } = req.body || {};
+    if (!file_base64 || !filename) {
+      return res.status(400).json({ error: 'file_base64 and filename are required' });
+    }
+    // Create a path under refund-images bucket
+    const owner = (user_id || email || 'anonymous').toString().replace(/[^a-zA-Z0-9_-]/g, '_');
+    const ts = Date.now();
+    const path = `${owner}/${ts}-${filename}`;
+    const buffer = Buffer.from(file_base64, 'base64');
+    const { error: uploadErr } = await supabaseAdmin.storage
+      .from('refund-images')
+      .upload(path, buffer, { contentType: content_type || 'application/octet-stream', upsert: true });
+    if (uploadErr) throw uploadErr;
+    const { data } = supabaseAdmin.storage.from('refund-images').getPublicUrl(path);
+    return res.json({ publicUrl: data.publicUrl, path });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to upload file' });
+  }
+});
+
+// List refund requests (admin)
+app.get('/api/admin/refunds', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Supabase service role is not configured on server' });
+    }
+    const { page = 1, limit = 50 } = req.query;
+    const p = Math.max(1, Number(page));
+    const l = Math.max(1, Math.min(200, Number(limit)));
+    const from = (p - 1) * l;
+    const to = from + l - 1;
+    const { data, error, count } = await supabaseAdmin
+      .from('refund_requests')
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(from, to);
+    if (error) throw error;
+    res.json({ refunds: data || [], pagination: { page: p, limit: l, total: count || 0, totalPages: Math.ceil((count || 0) / l) } });
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to fetch refunds' });
+  }
+});
+
+// Get single refund request (admin)
+app.get('/api/admin/refunds/:id', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Supabase service role is not configured on server' });
+    }
+    const { id } = req.params;
+    const { data, error } = await supabaseAdmin
+      .from('refund_requests')
+      .select('*')
+      .eq('id', id)
+      .single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: 'Refund not found' });
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to fetch refund' });
+  }
+});
+
+// Update refund status (admin)
+app.put('/api/admin/refund/:id/status', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Supabase service role is not configured on server' });
+    }
+    const { id } = req.params;
+    const { status, note } = req.body || {};
+    const allowed = ['pending', 'approved', 'rejected'];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ error: 'Invalid status' });
+    }
+    const { data, error } = await supabaseAdmin
+      .from('refund_requests')
+      .update({ status, note: note || null, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .select()
+      .single();
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message || 'Failed to update refund' });
+  }
+});
+
 // --- Routes ---
 // Add Route (with stops)
 app.post('/api/admin/route', async (req, res) => {
@@ -2549,46 +3070,38 @@ app.post('/api/admin/employee/create', async (req, res) => {
       });
     }
 
-    // Check if email already exists
-    const { data: existingEmployee } = await supabase
+    // Check if email already exists (use admin client to bypass RLS)
+    const { data: existingEmployees, error: existingErr } = await supabaseAdmin
       .from('users')
       .select('email')
-      .eq('email', email)
-      .single();
-
-    if (existingEmployee) {
-      return res.status(400).json({
-        error: 'Email already exists'
-      });
+      .eq('email', email);
+    if (existingErr) throw existingErr;
+    if (Array.isArray(existingEmployees) && existingEmployees.length > 0) {
+      return res.status(400).json({ error: 'Email already exists' });
     }
 
-    // 1. Create auth user (with email confirmation disabled in Supabase settings)
-    console.log('Creating Supabase auth user with email:', email);
-    const { data: authData, error: authError } = await supabase.auth.signUp({
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Supabase service role not configured' });
+    }
+
+    const { data: authAdminData, error: authAdminError } = await supabaseAdmin.auth.admin.createUser({
       email,
       password,
-      options: {
-        data: { username: email.split('@')[0], role },
-        emailRedirectTo: undefined // No email confirmation needed
-      }
+      email_confirm: true,
+      user_metadata: { username: email.split('@')[0], role }
     });
+    if (authAdminError) throw authAdminError;
+    const newUserId = authAdminData.user && authAdminData.user.id ? authAdminData.user.id : null;
+    if (!newUserId) return res.status(500).json({ error: 'Failed to create auth user' });
 
-    if (authError) {
-      console.log('Supabase auth signup error:', authError);
-      throw authError;
-    }
-
-    console.log('Supabase auth user created:', authData.user?.id);
-
-    // 2. Create user profile
-    const { data: userData, error: userError } = await supabase
+    const { data: userData, error: userError } = await supabaseAdmin
       .from('users')
       .insert({
-        id: authData.user.id,
-        username: email.split('@')[0], // Use email prefix as username
+        id: newUserId,
+        username: email.split('@')[0],
         email,
         role,
-        employee_id: null, // Remove employee_id since we're using email
+        employee_id: null,
         assigned_bus_id: busId || null,
         profile: {
           fullName,
@@ -2600,13 +3113,11 @@ app.post('/api/admin/employee/create', async (req, res) => {
       })
       .select()
       .single();
-
     if (userError) throw userError;
 
-    // If bus assigned, update bus table
     if (busId) {
       const updateField = role === 'driver' ? 'driver_id' : 'conductor_id';
-      await supabase
+      await supabaseAdmin
         .from('buses')
         .update({ [updateField]: userData.id })
         .eq('id', busId);
@@ -2621,7 +3132,14 @@ app.post('/api/admin/employee/create', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    const msg = (error && error.message ? String(error.message).toLowerCase() : '');
+    if (msg.includes('rate limit')) {
+      return res.status(429).json({ error: 'email rate limit exceeded' });
+    }
+    if (msg.includes('duplicate key') || msg.includes('already exists')) {
+      return res.status(409).json({ error: 'email already exists' });
+    }
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -2714,6 +3232,10 @@ app.get('/api/employee/my-bus', async (req, res) => {
           available_seats,
           current_location,
           status,
+          driver_id,
+          conductor_id,
+          driver:driver_id(id, username, email, profile),
+          conductor:conductor_id(id, username, email, profile),
           route:route_id(name, start_terminal_id, end_terminal_id)
         )
       `)
@@ -2729,9 +3251,34 @@ app.get('/api/employee/my-bus', async (req, res) => {
       return res.json({ message: 'No bus assigned', bus: null });
     }
 
+    let startName = null;
+    let endName = null;
+    const route = employee.bus?.route || null;
+    if (route && (route.start_terminal_id || route.end_terminal_id)) {
+      const ids = [route.start_terminal_id, route.end_terminal_id].filter(Boolean);
+      const { data: terminals } = await supabase
+        .from('terminals')
+        .select('id, name')
+        .in('id', ids);
+      if (terminals && terminals.length) {
+        const map = new Map(terminals.map(t => [t.id, t.name]));
+        startName = map.get(route.start_terminal_id) || null;
+        endName = map.get(route.end_terminal_id) || null;
+      }
+    }
+
+    const bus = employee.bus ? {
+      ...employee.bus,
+      route: route ? {
+        ...route,
+        start_terminal_name: startName,
+        end_terminal_name: endName
+      } : null
+    } : null;
+
     res.json({
       role: employee.role,
-      bus: employee.bus
+      bus
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
