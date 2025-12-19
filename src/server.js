@@ -87,6 +87,7 @@ app.post('/api/create-payment-session', async (req, res) => {
     // Create Stripe checkout session
     const origin =
       process.env.FRONTEND_URL ||
+      process.env.VITE_FRONTEND_URL ||
       req.headers.origin ||
       (req.get('referer') ? new URL(req.get('referer')).origin : 'https://auroride.xyz');
     const session = await stripe.checkout.sessions.create({
@@ -103,9 +104,8 @@ app.post('/api/create-payment-session', async (req, res) => {
         quantity: 1,
       }],
       mode: 'payment',
-      success_url: `${process.env.CLIENT_URL}/booking/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/booking/cancel`,
-      customer_email: booking.user_email,
+      success_url: `${origin}/booking-success?bookingId=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/booking?bookingId=${booking.id}`,
       metadata: {
         booking_id: booking.id,
         user_id: userId,
@@ -188,7 +188,7 @@ app.post('/webhook', async (req, res) => {
 const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, date }) => {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey || !to) return false;
-  const frontendUrl = process.env.FRONTEND_URL || 'https://auroride.xyz';
+  const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:5173';
   const logoUrl = "https://ysxcngthzeajjrxwqgvq.supabase.co/storage/v1/object/public/Public/AuroRide.jpg";
   const safeSeats = Array.isArray(seats) ? seats.join(', ') : (seats || 'N/A');
   const safeRoute = routeName || 'N/A';
@@ -287,7 +287,7 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
 const sendConfirmationEmail = async ({ to, booking, routeName, date }) => {
   const apiKey = process.env.RESEND_API_KEY;
   if (!apiKey || !to) return false;
-  const frontendUrl = process.env.FRONTEND_URL || 'https://auroride.xyz';
+  const frontendUrl = process.env.FRONTEND_URL || process.env.VITE_FRONTEND_URL || 'http://localhost:5173';
   const logoUrl = "https://ysxcngthzeajjrxwqgvq.supabase.co/storage/v1/object/public/Public/AuroRide.jpg";
   const safeRoute = routeName || 'N/A';
   const safeDate = date ? new Date(date).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
@@ -413,7 +413,8 @@ app.post('/api/client/booking/:id/send-receipt', async (req, res) => {
         .eq('id', id);
       return res.json({ success: true });
     } else {
-      return res.status(500).json({ error: 'Failed to send receipt' });
+      console.error('Receipt email failed to send for booking:', id);
+      return res.json({ success: true, email_failed: true, error: 'Failed to send receipt' });
     }
   } catch (err) {
     return res.status(500).json({ error: err && err.message ? err.message : 'Unexpected error' });
@@ -487,7 +488,8 @@ app.post('/api/client/booking/:id/confirm-payment', async (req, res) => {
         .eq('id', id);
       return res.json({ success: true, message: 'Receipt sent' });
     } else {
-      return res.status(500).json({ error: 'Failed to send receipt' });
+      console.error('Receipt email failed to send after payment confirmation:', id);
+      return res.json({ success: true, email_failed: true, message: 'Payment confirmed; email failed' });
     }
   } catch (err) {
     return res.status(500).json({ error: err && err.message ? err.message : 'Unexpected error' });
@@ -759,6 +761,10 @@ app.post('/api/client/create-payment-session', async (req, res) => {
     const lineAmount = Math.round((bookingPayload.amount || 15) * 100); // cents
     const seatCount = (seats && seats.length) || 1;
 
+    const origin =
+      process.env.FRONTEND_URL ||
+      req.headers.origin ||
+      (req.get('referer') ? new URL(req.get('referer')).origin : 'https://auroride.xyz');
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
       mode: 'payment',
