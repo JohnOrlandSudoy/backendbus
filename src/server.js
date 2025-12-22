@@ -5,6 +5,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const Stripe = require('stripe');
 const crypto = require('crypto');
+const sgMail = process.env.SENDGRID_API_KEY ? require('@sendgrid/mail') : null;
 
 dotenv.config();
 const app = express();
@@ -40,6 +41,8 @@ try {
 // Initialize Supabase
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const supabaseAdmin = process.env.SUPABASE_SERVICE_ROLE_KEY ? createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY) : null;
+if (sgMail) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+const passwordOtpStore = new Map();
 
 // Middleware
 app.use(cors());
@@ -2860,6 +2863,130 @@ app.post('/api/auth/login', async (req, res) => {
 
     // Fallback - return generic server error
     return res.status(500).json({ error: (error && error.message) ? error.message : String(error) });
+  }
+});
+
+app.post('/api/auth/send-otp', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email || typeof email !== 'string') {
+      return res.status(400).json({ error: 'Email is required' });
+    }
+    const normalized = email.trim().toLowerCase();
+    const { data: userRow, error: userError } = await supabase.from('users').select('id, email').eq('email', normalized).single();
+    if (userError || !userRow) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const code = (Math.floor(100000 + Math.random() * 900000)).toString();
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+    passwordOtpStore.set(normalized, { code, expiresAt, verified: false });
+    const apiKey = process.env.RESEND_API_KEY;
+    if (!apiKey) {
+      console.warn('RESEND_API_KEY not configured; falling back to console logging OTP');
+      console.log(`Password reset code for ${normalized}: ${code}`);
+    } else {
+      const fromAddr = process.env.RESEND_FROM_EMAIL || 'team@auroride.xyz';
+      const html = `
+        <div style="font-family:Arial,Helvetica,sans-serif;background:#f6f7fb;padding:24px">
+          <div style="max-width:560px;margin:0 auto;background:#fff;border-radius:12px;border:1px solid #e6e8ef;padding:24px">
+            <h2 style="margin:0 0 12px;color:#111827">Password Reset Code</h2>
+            <p style="color:#6b7280;margin:0 0 16px">Use the 6-digit code below to reset your password. This code expires in 10 minutes.</p>
+            <div style="font-size:28px;font-weight:700;letter-spacing:6px;color:#db2777;text-align:center;padding:16px 0">${code}</div>
+            <p style="color:#6b7280;margin:16px 0 0">If you did not request this, you can ignore this email.</p>
+          </div>
+        </div>
+      `;
+      try {
+        const resp = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify({
+            from: fromAddr,
+            to: [normalized],
+            subject: 'Your AuriRide password reset code',
+            html,
+          }),
+        });
+        if (!resp.ok) {
+          try {
+            const body = await resp.json();
+            console.error('Resend OTP email error', body);
+          } catch (_) {}
+        }
+      } catch (e) {
+        console.error('Resend OTP request failed', e);
+      }
+    }
+    return res.json({ success: true, message: 'OTP sent' });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to send OTP' });
+  }
+});
+
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ error: 'Email and code are required' });
+    }
+    const normalized = String(email).trim().toLowerCase();
+    const entry = passwordOtpStore.get(normalized);
+    if (!entry) {
+      return res.status(404).json({ error: 'No OTP found for this email' });
+    }
+    if (Date.now() > entry.expiresAt) {
+      passwordOtpStore.delete(normalized);
+      return res.status(400).json({ error: 'OTP expired' });
+    }
+    if (String(code) !== entry.code) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+    passwordOtpStore.set(normalized, { ...entry, verified: true });
+    return res.json({ success: true, message: 'OTP verified' });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to verify OTP' });
+  }
+});
+
+app.post('/api/auth/update-password-with-otp', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+      return res.status(500).json({ error: 'Service role key not configured' });
+    }
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+      return res.status(400).json({ error: 'Email, code, and newPassword are required' });
+    }
+    if (typeof newPassword !== 'string' || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+    const normalized = String(email).trim().toLowerCase();
+    const entry = passwordOtpStore.get(normalized);
+    if (!entry) {
+      return res.status(404).json({ error: 'No OTP found for this email' });
+    }
+    if (Date.now() > entry.expiresAt) {
+      passwordOtpStore.delete(normalized);
+      return res.status(400).json({ error: 'OTP expired' });
+    }
+    if (String(code) !== entry.code) {
+      return res.status(400).json({ error: 'Invalid OTP' });
+    }
+    const { data: userRow, error: userError } = await supabase.from('users').select('id, email').eq('email', normalized).single();
+    if (userError || !userRow) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    const { data, error } = await supabaseAdmin.auth.admin.updateUserById(userRow.id, { password: newPassword });
+    if (error) {
+      return res.status(500).json({ error: error.message || 'Failed to update password' });
+    }
+    passwordOtpStore.delete(normalized);
+    return res.json({ success: true, message: 'Password updated', data });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to update password' });
   }
 });
 // --- User Management (Admin) ---
