@@ -2979,12 +2979,23 @@ app.post('/api/auth/update-password-with-otp', async (req, res) => {
     if (userError || !userRow) {
       return res.status(404).json({ error: 'User not found' });
     }
-    const { data, error } = await supabaseAdmin.auth.admin.updateUserById(userRow.id, { password: newPassword });
-    if (error) {
-      return res.status(500).json({ error: error.message || 'Failed to update password' });
+    let updateResp = await supabaseAdmin.auth.admin.updateUserById(userRow.id, { password: newPassword });
+    if (updateResp.error && String(updateResp.error.message).toLowerCase().includes('user not found')) {
+      const list = await supabaseAdmin.auth.admin.listUsers({ page: 1, perPage: 200 });
+      if (list && Array.isArray(list.data?.users)) {
+        const byEmail = list.data.users.find(u => String(u.email).trim().toLowerCase() === normalized);
+        if (byEmail?.id) {
+          updateResp = await supabaseAdmin.auth.admin.updateUserById(byEmail.id, { password: newPassword });
+        }
+      }
+    }
+    if (updateResp.error) {
+      const msg = updateResp.error.message || 'Failed to update password';
+      const isNotFound = msg.toLowerCase().includes('user not found');
+      return res.status(isNotFound ? 404 : 500).json({ error: msg });
     }
     passwordOtpStore.delete(normalized);
-    return res.json({ success: true, message: 'Password updated', data });
+    return res.json({ success: true, message: 'Password updated', data: updateResp.data });
   } catch (err) {
     return res.status(500).json({ error: 'Failed to update password' });
   }
