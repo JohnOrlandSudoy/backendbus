@@ -196,7 +196,10 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
   const safeSeats = Array.isArray(seats) ? seats.join(', ') : (seats || 'N/A');
   const safeRoute = routeName || 'N/A';
   const safeDate = date ? new Date(date).toLocaleDateString(undefined, { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
-  const safeTotal = typeof totalPrice === 'number' ? `$${totalPrice}` : `$${Number(totalPrice || 0)}`;
+  const rate = 58.74;
+  const usdNum = typeof totalPrice === 'number' ? totalPrice : Number(totalPrice || 0);
+  const phpApprox = (usdNum * rate).toFixed(2);
+  const safeTotal = `$${usdNum} (≈ ₱${phpApprox} PHP)`;
   const html = `
   <div style="background-color:#f6f7fb;padding:24px 0;margin:0;font-family:Arial,Helvetica,sans-serif;">
     <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
@@ -235,7 +238,10 @@ const sendReceiptEmail = async ({ to, booking, totalPrice, seats, routeName, dat
                   </tr>
                   <tr style="background-color:#f9fafb;">
                     <td style="padding:12px 16px;font-size:12px;color:#6b7280;width:35%;">Total Paid</td>
-                    <td style="padding:12px 16px;font-size:14px;color:#db2777;font-weight:700;">${safeTotal}</td>
+                    <td style="padding:12px 16px;">
+                      <div style="font-size:14px;color:#db2777;font-weight:700;margin-bottom:2px;">$${usdNum}</div>
+                      <div style="font-size:12px;color:#111827;font-weight:600;">≈ ₱${phpApprox} PHP</div>
+                    </td>
                   </tr>
                 </table>
                 <div style="height:16px"></div>
@@ -761,7 +767,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
 
     if (bookingErr) throw bookingErr;
 
-    const lineAmount = Math.round((bookingPayload.amount || 15) * 100); // cents
+    const lineAmount = Math.round((bookingPayload.amount || 15) * 100); // total in cents
     const seatCount = (seats && seats.length) || 1;
 
     const origin =
@@ -775,10 +781,13 @@ app.post('/api/client/create-payment-session', async (req, res) => {
         {
           price_data: {
             currency: 'usd',
-            product_data: { name: `AuroRide — ${resolvedRouteName || booking.id}` },
+            product_data: { 
+              name: `AuroRide — ${resolvedRouteName || booking.id}`,
+              description: `${seatCount} seat(s) for ${date || 'selected date'}`
+            },
             unit_amount: lineAmount,
           },
-          quantity: seatCount,
+          quantity: 1, // charge the total once
         }
       ],
       customer_email: email,
