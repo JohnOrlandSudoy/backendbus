@@ -746,6 +746,26 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       // best-effort only
     }
 
+    // Check for approved discount
+    let discountMultiplier = 1.0;
+    if (resolvedUserId) {
+      const { data: discount } = await supabase
+        .from('discount_verifications')
+        .select('status')
+        .eq('user_id', resolvedUserId)
+        .eq('status', 'approved')
+        .single();
+      
+      if (discount) {
+        discountMultiplier = 0.8; // 20% discount
+      }
+    }
+
+    // Calculate amount with discount
+    const basePrice = 15;
+    const seatCount = (seats && seats.length) || 1;
+    const finalAmount = (basePrice * seatCount) * discountMultiplier;
+
     // Create booking with pending payment
     const bookingPayload = {
       user_id: resolvedUserId,
@@ -755,7 +775,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
       payment_status: 'pending',
       seats: seats || [],
       travel_date: date || null,
-      amount: totalAmount || (15 * (seats?.length || 1)),
+      amount: finalAmount,
       email: email,
     };
 
@@ -767,8 +787,7 @@ app.post('/api/client/create-payment-session', async (req, res) => {
 
     if (bookingErr) throw bookingErr;
 
-    const lineAmount = Math.round((bookingPayload.amount || 15) * 100); // total in cents
-    const seatCount = (seats && seats.length) || 1;
+    const lineAmount = Math.round(finalAmount * 100); // total in cents
 
     const origin =
       process.env.FRONTEND_URL ||
@@ -1678,6 +1697,201 @@ app.get('/api/client/notifications/unread-count', async (req, res) => {
   }
 });
 
+// --- Discount Verification Endpoints ---
+
+// Client: Submit discount verification request
+app.post('/api/client/discount-verification', async (req, res) => {
+  console.log('Received discount verification submission');
+  try {
+    if (!supabaseAdmin) {
+      console.error('Supabase service role is not configured');
+      return res.status(500).json({ error: 'Server configuration error' });
+    }
+
+    const { userId, type, idImageUrl, email, username, fullName } = req.body;
+    console.log(`Submitting verification for user: ${userId}, type: ${type}`);
+
+    if (!userId || !type || !idImageUrl) {
+      return res.status(400).json({ error: 'userId, type, and idImageUrl are required' });
+    }
+
+    const { data: userRow, error: userCheckError } = await supabaseAdmin
+      .from('users')
+      .select('id')
+      .eq('id', userId)
+      .maybeSingle();
+    if (userCheckError && userCheckError.code !== 'PGRST116') {
+      throw userCheckError;
+    }
+    if (!userRow) {
+      const { error: userInsertError } = await supabaseAdmin
+        .from('users')
+        .insert({
+          id: userId,
+          email: email || `user_${userId}@example.com`,
+          username: username || (email ? email.split('@')[0] : `user_${String(userId).slice(0, 8)}`),
+          role: 'client',
+          status: 'active',
+          profile: fullName ? { fullName } : {}
+        });
+      if (userInsertError && userInsertError.code !== '23505') {
+        throw userInsertError;
+      }
+    }
+
+    // Check if there's an existing pending verification
+    // Use supabaseAdmin to bypass RLS
+    const { data: existing, error: existingError } = await supabaseAdmin
+      .from('discount_verifications')
+      .select('id, status')
+      .eq('user_id', userId)
+      .eq('status', 'pending')
+      .maybeSingle();
+      
+    if (existingError) {
+      console.error('Error checking existing verification:', existingError);
+      throw existingError;
+    }
+
+    if (existing) {
+      return res.status(400).json({ error: 'You already have a pending verification request' });
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('discount_verifications')
+      .insert({
+        user_id: userId,
+        type,
+        id_image_url: idImageUrl,
+        status: 'pending',
+        submitted_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error inserting verification:', error);
+      throw error;
+    }
+
+    console.log('Verification submitted successfully:', data);
+    res.status(201).json(data);
+  } catch (error) {
+    console.error('Discount verification submission error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Client: Get discount verification status
+app.get('/api/client/discount-verification/:userId', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+       return res.status(500).json({ error: 'Server configuration error' });
+    }
+    const { userId } = req.params;
+
+    // Use supabaseAdmin to bypass RLS
+    const { data, error } = await supabaseAdmin
+      .from('discount_verifications')
+      .select('*')
+      .eq('user_id', userId)
+      .order('submitted_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!data) {
+      return res.json({ status: 'none' });
+    }
+
+    res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: Get discount verifications with filters and pagination
+app.get('/api/admin/discount-verifications', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+       return res.status(500).json({ error: 'Server configuration error' });
+    }
+    const { status, page = 1, limit = 20 } = req.query;
+    const offset = (page - 1) * limit;
+
+    let query = supabaseAdmin
+      .from('discount_verifications')
+      .select(`
+        *,
+        user:user_id(id, username, email, profile)
+      `, { count: 'exact' });
+
+    if (status && status !== 'all') {
+      query = query.eq('status', status);
+    }
+
+    const { data, error, count } = await query
+      .order('submitted_at', { ascending: false })
+      .range(offset, offset + parseInt(limit) - 1);
+
+    if (error) throw error;
+
+    res.json({
+      verifications: data,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total: count,
+        totalPages: Math.ceil(count / limit)
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Admin: Approve/Reject discount verification
+app.put('/api/admin/discount-verification/:id', async (req, res) => {
+  try {
+    if (!supabaseAdmin) {
+       return res.status(500).json({ error: 'Server configuration error' });
+    }
+    const { id } = req.params;
+    const { status, rejectionReason, adminId } = req.body;
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ error: 'Invalid status. Must be approved or rejected' });
+    }
+
+    const { data: verification, error: updateError } = await supabaseAdmin
+      .from('discount_verifications')
+      .update({
+        status,
+        rejection_reason: status === 'rejected' ? rejectionReason : null,
+        verified_at: new Date().toISOString(),
+        verified_by: adminId
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (updateError) throw updateError;
+
+    // Notify the user
+    await supabaseAdmin.from('notifications').insert({
+      recipient_id: verification.user_id,
+      type: 'general',
+      title: 'Discount Verification Update',
+      message: `Your discount verification for ${verification.type} has been ${status}.${status === 'rejected' ? ` Reason: ${rejectionReason}` : ''}`
+    });
+
+    res.json(verification);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // --- Employee Notification Endpoints ---
 
 // Get employee's notifications
@@ -2125,6 +2339,48 @@ app.post('/api/client/refund/upload', async (req, res) => {
     return res.json({ publicUrl: data.publicUrl, path });
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to upload file' });
+  }
+});
+
+// Upload ID for discount verification
+app.post('/api/client/discount/upload', async (req, res) => {
+  console.log('Received discount ID upload request');
+  try {
+    if (!supabaseAdmin) {
+      console.error('Supabase service role is not configured on server');
+      return res.status(500).json({ error: 'Supabase service role is not configured on server' });
+    }
+    const { file_base64, filename, content_type, user_id, email } = req.body || {};
+    
+    console.log(`Processing upload for user: ${user_id || email}, filename: ${filename}`);
+
+    if (!file_base64 || !filename) {
+      console.error('Missing file_base64 or filename');
+      return res.status(400).json({ error: 'file_base64 and filename are required' });
+    }
+    // Create a path under ID bucket
+    const owner = (user_id || email || 'anonymous').toString().replace(/[^a-zA-Z0-9_-]/g, '_');
+    const ts = Date.now();
+    const path = `${owner}/${ts}-${filename}`;
+    const buffer = Buffer.from(file_base64, 'base64');
+    
+    // Upload to 'ID' bucket
+    console.log(`Uploading to bucket 'ID' at path: ${path}`);
+    const { error: uploadErr } = await supabaseAdmin.storage
+      .from('ID')
+      .upload(path, buffer, { contentType: content_type || 'application/octet-stream', upsert: true });
+    
+    if (uploadErr) {
+      console.error('Supabase upload error:', uploadErr);
+      throw uploadErr;
+    }
+    
+    const { data } = supabaseAdmin.storage.from('ID').getPublicUrl(path);
+    console.log('Upload successful, public URL:', data.publicUrl);
+    return res.json({ publicUrl: data.publicUrl, path });
+  } catch (error) {
+    console.error('Upload endpoint error:', error);
+    return res.status(500).json({ error: error.message || 'Failed to upload ID' });
   }
 });
 
@@ -2731,6 +2987,53 @@ app.get('/api/admin/bus-locations', async (req, res) => {
       .select('id, bus_number, current_location');
     if (error) throw error;
     res.json(data);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// --- Client API ---
+
+// Get all buses for client (with route info)
+app.get('/api/client/buses', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('buses')
+      .select('*, route:routes(name)')
+      .eq('status', 'active');
+
+    if (error) throw error;
+    
+    const transformed = data.map(bus => ({
+      ...bus,
+      route_name: bus.route?.name
+    }));
+
+    res.json(transformed);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get ETAs for client
+app.get('/api/client/bus-eta', async (req, res) => {
+  try {
+    const { data: buses, error } = await supabase
+      .from('buses')
+      .select('id, bus_number, current_location, route:routes(name, start_terminal_id, end_terminal_id)')
+      .eq('status', 'active');
+
+    if (error) throw error;
+
+    const etas = buses.map(bus => ({
+      busId: bus.id,
+      busNumber: bus.bus_number,
+      eta: '15 mins', // Placeholder
+      currentLocation: bus.current_location,
+      route: bus.route
+    }));
+
+    res.json(etas);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
