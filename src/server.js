@@ -10,6 +10,25 @@ const sgMail = process.env.SENDGRID_API_KEY ? require('@sendgrid/mail') : null;
 dotenv.config();
 const app = express();
 
+function normalizeLatLng(value) {
+  if (value == null) return null;
+  let loc = value;
+  if (typeof loc === 'string') {
+    try {
+      loc = JSON.parse(loc);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof loc !== 'object' || loc === null) return null;
+  const latRaw = loc.lat ?? loc.latitude;
+  const lngRaw = loc.lng ?? loc.longitude ?? loc.lon;
+  const lat = typeof latRaw === 'number' ? latRaw : parseFloat(latRaw);
+  const lng = typeof lngRaw === 'number' ? lngRaw : parseFloat(lngRaw);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  return { lat, lng };
+}
+
 // Initialize Stripe and SendGrid if keys are present
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2022-11-15' }) : null;
 
@@ -46,7 +65,10 @@ const passwordOtpStore = new Map();
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use((req, res, next) => {
+  if (req.originalUrl === '/webhook') return next();
+  return express.json({ limit: '10mb' })(req, res, next);
+});
 
 // Ensure oversized JSON bodies return JSON, not HTML
 app.use((err, req, res, next) => {
@@ -628,34 +650,37 @@ app.get('/api/rt/notifications/:userId', (req, res) => {
   });
 });
 
-// Client Routes
-app.get('/api/client/bus-eta', async (req, res) => {
-  try {
-    const { data: buses, error } = await supabase
-      .from('buses')
-      .select('id, bus_number, route_id, current_location, route:routes(name, start_terminal_id, end_terminal_id)')
-      .eq('status', 'active');
-    
-    if (error) throw error;
-    
-    // Map buses to include ETA (placeholder) and relevant details
-    const response = buses.map(bus => ({
-      busId: bus.id,
-      busNumber: bus.bus_number,
-      eta: '15 minutes', // Placeholder: Replace with mapping API logic
-      currentLocation: bus.current_location,
-      route: bus.route
-    }));
-
-    res.json(response);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
 app.post('/api/client/booking', async (req, res) => {
   try {
-    const { userId, busId } = req.body;
+    const {
+      userId,
+      busId,
+      seats,
+      seat_number,
+      travel_date,
+      date,
+      email,
+      payment_method,
+      amount,
+      pickup_address,
+      pickup_lat,
+      pickup_lng,
+      pickup_location_source,
+    } = req.body;
+
+    const seatList = Array.isArray(seats) && seats.length
+      ? seats
+      : seat_number != null
+        ? [seat_number]
+        : [];
+
+    if (!busId) {
+      return res.status(400).json({ error: 'busId is required' });
+    }
+    if (seatList.length === 0) {
+      return res.status(400).json({ error: 'At least one seat is required' });
+    }
+
     const isValidUUID = (v) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
     const resolvedUserId = isValidUUID(userId) ? userId : null;
     if (resolvedUserId) {
@@ -665,22 +690,52 @@ app.post('/api/client/booking', async (req, res) => {
         .eq('id', resolvedUserId)
         .single();
       if (!existingUser) {
-        const email = req.body.email || '';
-        const username = email ? email.split('@')[0] : 'user';
+        const userEmail = email || req.body.email || '';
+        const username = userEmail ? userEmail.split('@')[0] : 'user';
         await supabase
           .from('users')
-          .insert({ id: resolvedUserId, email, username, role: 'client', profile: {} });
+          .insert({ id: resolvedUserId, email: userEmail, username, role: 'client', profile: {} });
       }
     }
+
+    const travelDate = travel_date || date || null;
+    const resolvedAmount =
+      typeof amount === 'number' && Number.isFinite(amount)
+        ? amount
+        : 15 * seatList.length;
+
+    const pickupPayload =
+      pickup_lat != null &&
+      pickup_lng != null &&
+      Number.isFinite(Number(pickup_lat)) &&
+      Number.isFinite(Number(pickup_lng))
+        ? {
+            pickup_address: pickup_address || null,
+            pickup_lat: Number(pickup_lat),
+            pickup_lng: Number(pickup_lng),
+            pickup_location_source: pickup_location_source || 'search',
+          }
+        : {};
+
     const { data: booking, error } = await supabase
       .from('bookings')
-      .insert({ user_id: resolvedUserId, bus_id: busId })
+      .insert({
+        user_id: resolvedUserId,
+        bus_id: busId,
+        status: 'pending',
+        payment_method: payment_method || 'cash',
+        payment_status: 'pending',
+        seats: seatList,
+        travel_date: travelDate,
+        amount: resolvedAmount,
+        email: email || null,
+        ...pickupPayload,
+      })
       .select()
       .single();
 
     if (error) throw error;
 
-    // Fetch current available seats
     const { data: bus, error: busError } = await supabase
       .from('buses')
       .select('available_seats')
@@ -688,14 +743,60 @@ app.post('/api/client/booking', async (req, res) => {
       .single();
     if (busError) throw busError;
 
-    // Decrement and update
-    const newSeats = bus.available_seats - 1;
+    const newSeats = Math.max(0, (bus.available_seats || 0) - seatList.length);
     await supabase
       .from('buses')
       .update({ available_seats: newSeats })
       .eq('id', busId);
 
     res.status(201).json(booking);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Save / update passenger pickup location on a booking
+app.patch('/api/client/booking/:id/pickup', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { pickup_address, pickup_lat, pickup_lng, pickup_location_source, userId } = req.body || {};
+
+    if (!id) {
+      return res.status(400).json({ error: 'Booking id is required' });
+    }
+
+    const lat = pickup_lat != null ? Number(pickup_lat) : NaN;
+    const lng = pickup_lng != null ? Number(pickup_lng) : NaN;
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: 'Valid pickup_lat and pickup_lng are required' });
+    }
+
+    const allowedSources = ['gps', 'search', 'manual', 'approximate'];
+    const source = allowedSources.includes(pickup_location_source)
+      ? pickup_location_source
+      : 'manual';
+
+    let updateQuery = supabase
+      .from('bookings')
+      .update({
+        pickup_address: pickup_address || null,
+        pickup_lat: lat,
+        pickup_lng: lng,
+        pickup_location_source: source,
+      })
+      .eq('id', id);
+
+    if (userId) {
+      updateQuery = updateQuery.eq('user_id', userId);
+    }
+
+    const { data, error } = await updateQuery.select().single();
+    if (error) throw error;
+    if (!data) {
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    res.json(data);
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -973,6 +1074,7 @@ app.get('/api/client/bookings', async (req, res) => {
       .from('bookings')
       .select(`
         id, user_id, bus_id, status, payment_method, payment_status, seats, amount, travel_date, created_at, receipt_sent,
+        pickup_address, pickup_lat, pickup_lng, pickup_location_source,
         bus:bus_id(bus_number, route:route_id(name)),
         user:user_id(username, email, profile)
       `)
@@ -2147,18 +2249,39 @@ app.delete('/api/admin/report/:id', async (req, res) => {
 });
 
 // --- Terminals ---
-// Add Terminal
+// Add Terminal (requires map-verified coordinates)
 app.post('/api/admin/terminal', async (req, res) => {
   try {
-    const { name, address } = req.body;
+    const { name, address, lat, lng, place_id, formatted_address, map_verified } = req.body;
+
+    if (!name || !address) {
+      return res.status(400).json({ error: 'Name and address are required' });
+    }
+    if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+      return res.status(400).json({ error: 'Terminal location must be verified on the map (valid lat/lng required)' });
+    }
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      return res.status(400).json({ error: 'Invalid coordinates' });
+    }
+    if (map_verified !== true) {
+      return res.status(400).json({ error: 'Terminal must be confirmed on the map before saving (map_verified: true)' });
+    }
+
     const { data, error } = await supabase
       .from('terminals')
-      .insert([{ name, address }])
+      .insert([{
+        name,
+        address,
+        lat,
+        lng,
+        place_id: place_id || null,
+        formatted_address: formatted_address || address,
+        map_verified: true,
+      }])
       .select()
       .single();
     if (error) throw error;
     res.status(201).json(data);
-    // Note: Removed message.success as it's not defined in Node.js (likely frontend code)
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2190,17 +2313,15 @@ app.get('/api/admin/terminals', async (req, res) => {
 app.put('/api/admin/terminal/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, address } = req.body;
+    const { name, address, lat, lng, place_id, formatted_address, map_verified } = req.body;
 
-    // Validate required fields
     if (!name || !address) {
       return res.status(400).json({ error: 'Name and address are required' });
     }
 
-    // Check if terminal exists
     const { data: existingTerminal, error: checkError } = await supabase
       .from('terminals')
-      .select('id')
+      .select('id, lat, lng, map_verified')
       .eq('id', id)
       .single();
 
@@ -2208,10 +2329,32 @@ app.put('/api/admin/terminal/:id', async (req, res) => {
       return res.status(404).json({ error: 'Terminal not found' });
     }
 
-    // Update terminal
+    const payload = { name, address };
+
+    if (lat !== undefined || lng !== undefined || map_verified !== undefined) {
+      if (typeof lat !== 'number' || typeof lng !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return res.status(400).json({ error: 'Valid lat/lng required when updating map location' });
+      }
+      if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        return res.status(400).json({ error: 'Invalid coordinates' });
+      }
+      if (map_verified !== true) {
+        return res.status(400).json({ error: 'Re-confirm the terminal location on the map before saving' });
+      }
+      payload.lat = lat;
+      payload.lng = lng;
+      payload.place_id = place_id || null;
+      payload.formatted_address = formatted_address || address;
+      payload.map_verified = true;
+    } else if (!existingTerminal.map_verified) {
+      return res.status(400).json({
+        error: 'This terminal has no verified map location. Please set location using the map picker.',
+      });
+    }
+
     const { data, error } = await supabase
       .from('terminals')
-      .update({ name, address })
+      .update(payload)
       .eq('id', id)
       .select()
       .single();
@@ -3025,13 +3168,46 @@ app.get('/api/client/bus-eta', async (req, res) => {
 
     if (error) throw error;
 
-    const etas = buses.map(bus => ({
-      busId: bus.id,
-      busNumber: bus.bus_number,
-      eta: '15 mins', // Placeholder
-      currentLocation: bus.current_location,
-      route: bus.route
-    }));
+    const trackingBaseUrl =
+      process.env.TRACKING_SERVER_URL ||
+      process.env.VITE_TRACKING_URL ||
+      process.env.TRACKING_URL ||
+      null;
+
+    let latestByBusId = null;
+    if (trackingBaseUrl) {
+      try {
+        const base = String(trackingBaseUrl).replace(/\/$/, '');
+        const r = await fetch(`${base}/api/admin/locations`);
+        if (r.ok) {
+          const json = await r.json();
+          if (Array.isArray(json)) {
+            latestByBusId = new Map(
+              json
+                .filter((x) => x && typeof x === 'object' && x.busId)
+                .map((x) => [x.busId, x.latest])
+            );
+          }
+        }
+      } catch (_) {
+        latestByBusId = null;
+      }
+    }
+
+    const etas = buses.map(bus => {
+      const tracked = latestByBusId?.get(bus.id);
+      const currentLocation =
+        normalizeLatLng(tracked) || normalizeLatLng(bus.current_location);
+
+      return {
+        busId: bus.id,
+        busNumber: bus.bus_number,
+        eta: '15 mins',
+        currentLocation,
+        route: bus.route,
+        locationSource: tracked ? 'employee_live' : currentLocation ? 'database' : null,
+      };
+    });
 
     res.json(etas);
   } catch (error) {
